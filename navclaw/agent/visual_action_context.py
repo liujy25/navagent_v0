@@ -11,63 +11,69 @@ if TYPE_CHECKING:
     from navclaw.agent.state import NavClawAgentState, NavClawStepState
 
 
-VISUAL_ACTION_ANGLES = [0, 60, 120, 180, 240, 300]
+PANORAMA_DIRECTION_ORDER = ("front", "back", "left", "right")
+_DIRECTION_BY_ANGLE = {
+    0: "front",
+    180: "back",
+    90: "left",
+    270: "right",
+}
+_ANGLE_BY_DIRECTION = {
+    direction: angle for angle, direction in _DIRECTION_BY_ANGLE.items()
+}
+VISUAL_ACTION_ANGLES = [
+    _ANGLE_BY_DIRECTION[direction] for direction in PANORAMA_DIRECTION_ORDER
+]
 
 
 def visual_action_angles(views: list["VisualViewContext"]) -> list[int]:
     return [int(view.angle_deg) for view in views]
 
 
-def ordered_panorama_angles_left_to_right(angles: list[int]) -> list[int]:
-    return sorted([int(angle) for angle in angles], key=_signed_left_angle, reverse=True)
+def direction_for_angle(angle: int) -> str:
+    normalized = int(angle) % 360
+    try:
+        return _DIRECTION_BY_ANGLE[normalized]
+    except KeyError as exc:
+        raise ValueError(f"panorama angle has no cardinal direction: {angle}") from exc
 
 
-def ordered_visual_views_left_to_right(views: list["VisualViewContext"]) -> list["VisualViewContext"]:
-    views_by_angle = {int(view.angle_deg): view for view in views}
+def angle_for_direction(direction: object) -> int:
+    normalized = str(direction).strip().lower()
+    try:
+        return int(_ANGLE_BY_DIRECTION[normalized])
+    except KeyError as exc:
+        raise ValueError(f"invalid panorama direction: {direction!r}") from exc
+
+
+def ordered_panorama_angles(angles: list[int]) -> list[int]:
+    angles_by_direction = {
+        direction_for_angle(int(angle)): int(angle) % 360 for angle in angles
+    }
     return [
-        views_by_angle[int(angle)]
-        for angle in ordered_panorama_angles_left_to_right(list(views_by_angle))
+        angles_by_direction[direction]
+        for direction in PANORAMA_DIRECTION_ORDER
+        if direction in angles_by_direction
     ]
 
 
-def allowed_angles_text(angles: list[int]) -> str:
-    return "[" + ", ".join(str(int(angle)) for angle in angles) + "]"
+def ordered_visual_views(views: list["VisualViewContext"]) -> list["VisualViewContext"]:
+    views_by_angle = {int(view.angle_deg): view for view in views}
+    return [
+        views_by_angle[int(angle)]
+        for angle in ordered_panorama_angles(list(views_by_angle))
+    ]
 
 
-def panorama_angle_order_text(angles: list[int]) -> str:
-    ordered = ordered_panorama_angles_left_to_right(angles)
-    return ", ".join(f"angle_{int(angle)}" for angle in ordered)
+def allowed_directions(angles: list[int]) -> list[str]:
+    available = {direction_for_angle(angle) for angle in angles}
+    return [
+        direction for direction in PANORAMA_DIRECTION_ORDER if direction in available
+    ]
 
 
-def relative_direction_text(angle: int) -> str:
-    normalized = int(angle) % 360
-    if normalized == 0:
-        return "front"
-    if normalized == 180:
-        return "back"
-    if normalized < 180:
-        return "left" if normalized == 90 else f"{normalized} degrees left"
-    right_degrees = 360 - normalized
-    return "right" if right_degrees == 90 else f"{right_degrees} degrees right"
-
-
-def angle_convention_text(
-    angles: list[int],
-    *,
-    heading_reference: str = "the current robot heading",
-) -> str:
-    mappings = "; ".join(
-        f"angle_{int(angle) % 360}={relative_direction_text(angle)}"
-        for angle in angles
-    )
-    return f"Angles are relative to {heading_reference}: {mappings}."
-
-
-def _signed_left_angle(angle: int) -> float:
-    normalized = float(int(angle) % 360)
-    if normalized > 180.0:
-        normalized -= 360.0
-    return normalized
+def allowed_directions_text(angles: list[int]) -> str:
+    return "[" + ", ".join(allowed_directions(angles)) + "]"
 
 
 @dataclass(frozen=True)

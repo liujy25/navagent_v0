@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from navclaw.agent.visual_action_context import angle_convention_text
+from navclaw.agent.visual_action_context import angle_for_direction
+from navclaw.agent.visual_action_context import direction_for_angle
+from navclaw.agent.visual_action_context import ordered_panorama_angles
 from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext
 from navclaw.agent.visual_grounding import VisualWaypoint
 from navclaw.agent.visual_policy_decisions import LocalMovePlanDecision
@@ -45,7 +47,7 @@ VLN_WAYPOINT_INHERITED_CONTEXT_SYSTEM_PROMPT = """
 You are the VLN Waypoint Planner of an embodied navigation agent.
 Continue the Navigation step context by grounding its Navigation action to one available labeled waypoint candidate.
 Use the progress updates, Navigation reasoning, waypoint reference context, and candidate overlays as grounding evidence.
-Write concise grounding reasoning before the selected angle and candidate label.
+Write concise grounding reasoning before the selected direction and candidate label.
 """.strip()
 
 VLN_WAYPOINT_ACTIVE_PROGRESS_SYSTEM_PROMPT = """
@@ -160,7 +162,7 @@ def plan_vln_waypoint_loop(
             loop_events.append(
                 {
                     "event_type": "sampled_waypoint_candidates_unavailable",
-                    "selected_angle_deg": None,
+                    "selected_direction": None,
                     "selected_obs_id": "",
                     "decision": {},
                     "feedback": {
@@ -212,7 +214,7 @@ def plan_vln_waypoint_loop(
             loop_events.append(
                 {
                     "event_type": "sampled_waypoint_selection_invalid",
-                    "selected_angle_deg": candidate_response.get("selected_angle_deg"),
+                    "selected_direction": candidate_response.get("selected_direction"),
                     "selected_obs_id": "",
                     "decision": {},
                     "candidate_selection": deepcopy(candidate_response),
@@ -330,7 +332,7 @@ def _generate_all_view_sampled_candidates(
     except ValueError as exc:
         return [], [
             {
-                "selected_angle_deg": None,
+                "selected_direction": None,
                 "selected_obs_id": "",
                 "failure_reason": f"unified_sampled_waypoint_generation_failed:{exc}",
             }
@@ -343,7 +345,7 @@ def _generate_all_view_sampled_candidates(
         if candidates == []:
             failures.append(
                 {
-                    "selected_angle_deg": int(selected_view.angle_deg),
+                    "selected_direction": direction_for_angle(selected_view.angle_deg),
                     "selected_obs_id": str(selected_view.obs_id),
                     "failure_reason": "no_projected_sampled_waypoint_candidates_for_view",
                 }
@@ -388,7 +390,10 @@ def _rgb_overlay_for_view(
     for item in view_candidate_sets:
         if int(item.view.angle_deg) == int(selected_view.angle_deg):
             return np.asarray(item.rgb_overlay, dtype=np.uint8)
-    raise ValueError(f"missing sampled waypoint overlay for angle_{int(selected_view.angle_deg)}")
+    raise ValueError(
+        "missing sampled waypoint overlay for "
+        f"{direction_for_angle(selected_view.angle_deg)}"
+    )
 
 
 def _run_vln_sampled_waypoint_candidate_selector(
@@ -462,7 +467,7 @@ def _run_vln_sampled_waypoint_candidate_selector(
             ),
         }
     )
-    for item in view_candidate_sets:
+    for item in _ordered_view_candidate_sets(view_candidate_sets):
         user_prompt.append(
             {
                 "type": "text",
@@ -577,9 +582,9 @@ def _build_vln_active_progress_waypoint_prompt(
     return f"""
 {retry_section}
 Rules:
-- Choose exactly one candidate_label and one selected_angle_deg where that label is visible.
+- Choose exactly one candidate_label and one selected_direction where that label is visible.
 - candidate_label identifies one provided world-space waypoint.
-- selected_angle_deg identifies the RGB view that provides the clearest task-relevant evidence for the selected candidate.
+- selected_direction identifies the RGB view that provides the clearest task-relevant evidence for the selected candidate.
 - Use the accumulated task progress, retrieval conclusions, and Navigation action reasoning to preserve the current navigation decision.
 - Use the RGB overlays to compare semantic and route relevance.
 - Use the candidate BEV to compare spatial direction and relative position.
@@ -588,7 +593,7 @@ Rules:
 Return exactly these JSON fields in the shown order:
 {{
   "reasoning": "<why this candidate best advances the current Navigation action, based on the accumulated context and relevant RGB/BEV evidence>",
-  "selected_angle_deg": 0,
+  "selected_direction": "front",
   "candidate_label": 1
 }}
 """.strip()
@@ -616,13 +621,13 @@ def _build_vln_inherited_waypoint_grounding_prompt(
         "inherited evidence for the selected candidate>"
     )
     selection_rules = """
-- Choose exactly one candidate_label and one selected_angle_deg where that label is visible.
-- candidate_label identifies the world-space waypoint; selected_angle_deg identifies its grounding view.
+- Choose exactly one candidate_label and one selected_direction where that label is visible.
+- candidate_label identifies the world-space waypoint; selected_direction identifies its grounding view.
 """.strip()
     output_schema = f"""
 {{
   "reasoning": "{reasoning_schema}",
-  "selected_angle_deg": 0,
+  "selected_direction": "front",
   "candidate_label": 1
 }}
 """.strip()
@@ -670,10 +675,10 @@ Updated task progress memory:
 {task_progress_text}
 """.rstrip()
         task_instruction = "Analyze the current active VLN progress item"
-    overlay_contents = "view angle, available waypoint labels, and visible landmarks"
+    overlay_contents = "view direction, available waypoint labels, and visible landmarks"
     if include_graph_context:
         overlay_contents = (
-            "view angle, available waypoint labels, visible visited nodes, and visible landmarks"
+            "view direction, available waypoint labels, visible visited nodes, and visible landmarks"
         )
     evidence_description = f"""
 {len(view_candidate_sets)} sampled waypoint RGB overlays are attached separately after this prompt.
@@ -730,8 +735,8 @@ Task:
 {task_instruction} and select the sampled waypoint candidate that best advances it.
 
 Rules:
-- Choose exactly one candidate_label and one selected_angle_deg where that label is visible.
-- candidate_label determines the world-space waypoint; selected_angle_deg determines which RGB projection of that waypoint is used.
+- Choose exactly one candidate_label and one selected_direction where that label is visible.
+- candidate_label determines the world-space waypoint; selected_direction determines which RGB projection of that waypoint is used.
 {evidence_rules}
 - Do not choose a label merely because it is closest to the agent.
 - Choose the best candidate from the provided labels; leave failure_reason empty after a valid selection.
@@ -740,7 +745,7 @@ Return JSON only:
 {{
   "progress_alignment_evidence": "{progress_evidence_schema}",
   "reasoning": "{reasoning_schema}",
-  "selected_angle_deg": 0,
+  "selected_direction": "front",
   "candidate_label": 1,
   "failure_reason": ""
 }}
@@ -748,11 +753,17 @@ Return JSON only:
 
 
 def _waypoint_overlay_angles(available_angles: list[int]) -> list[int]:
-    available = {int(angle) for angle in available_angles}
-    preferred = [0, 90, 180, 270]
-    ordered = [angle for angle in preferred if angle in available]
-    ordered.extend(sorted(angle for angle in available if angle not in set(preferred)))
-    return ordered
+    return ordered_panorama_angles(available_angles)
+
+
+def _ordered_view_candidate_sets(
+    view_candidate_sets: list[_VlnViewCandidateSet],
+) -> list[_VlnViewCandidateSet]:
+    by_angle = {int(item.view.angle_deg): item for item in view_candidate_sets}
+    return [
+        by_angle[angle]
+        for angle in ordered_panorama_angles(list(by_angle))
+    ]
 
 
 def _waypoint_rgb_context_text(
@@ -764,10 +775,6 @@ def _waypoint_rgb_context_text(
 ) -> str:
     lines = [
         f"Waypoint RGB overlays: {len(view_candidate_sets)} directional views.",
-        angle_convention_text(
-            [int(item.view.angle_deg) for item in view_candidate_sets],
-            heading_reference=str(heading_reference),
-        ),
         "- Numbered circles are waypoint candidates.",
         "- The same label in multiple views is one world-space waypoint.",
     ]
@@ -816,7 +823,7 @@ def _view_overlay_prompt_text(
 ) -> str:
     angle = int(view_candidate_set.view.angle_deg)
     lines = [
-        f"Sampled waypoint RGB overlay for angle_{angle}.",
+        f"Sampled waypoint RGB overlay for {direction_for_angle(angle)}.",
         f"- Available waypoint labels: {_candidate_labels_text(view_candidate_set.candidates)}.",
     ]
     if include_graph_context:
@@ -857,7 +864,7 @@ def _selected_sampled_candidate(
         reasoning_index = response_fields.index("reasoning")
         selection_indices = [
             response_fields.index(field_name)
-            for field_name in ("selected_angle_deg", "candidate_label")
+            for field_name in ("selected_direction", "candidate_label")
             if field_name in response_fields
         ]
         if selection_indices and reasoning_index > min(selection_indices):
@@ -865,13 +872,20 @@ def _selected_sampled_candidate(
     raw_label = response.get("candidate_label")
     if raw_label is None:
         return None, None, str(response.get("failure_reason", "candidate_selector_returned_null_label")).strip()
+    raw_direction = response.get("selected_direction")
     raw_angle = response.get("selected_angle_deg")
-    if raw_angle is None:
-        return None, None, "candidate_selector_missing_selected_angle_deg"
-    try:
-        selected_angle = int(raw_angle)
-    except (TypeError, ValueError):
-        return None, None, f"candidate_selector_invalid_selected_angle_deg:{raw_angle!r}"
+    if raw_direction is None and raw_angle is None:
+        return None, None, "candidate_selector_missing_selected_direction"
+    if raw_direction is not None:
+        try:
+            selected_angle = angle_for_direction(raw_direction)
+        except ValueError:
+            return None, None, f"candidate_selector_invalid_direction:{raw_direction!r}"
+    else:
+        try:
+            selected_angle = int(raw_angle)
+        except (TypeError, ValueError):
+            return None, None, f"candidate_selector_invalid_direction:{raw_angle!r}"
     try:
         label = int(raw_label)
     except (TypeError, ValueError):
@@ -886,10 +900,13 @@ def _selected_sampled_candidate(
             if angle == selected_angle:
                 return candidate, item.view, ""
     if available_angles != []:
-        angles_text = "_".join(str(angle) for angle in available_angles)
+        directions_text = "_".join(
+            direction_for_angle(angle) for angle in available_angles
+        )
         return None, None, (
-            f"candidate_selector_angle_label_mismatch:"
-            f"angle_{selected_angle}_label_{label}_available_at_angles_{angles_text}"
+            f"candidate_selector_direction_label_mismatch:"
+            f"{direction_for_angle(selected_angle)}_label_{label}_"
+            f"available_at_{directions_text}"
         )
     return None, None, f"candidate_selector_unavailable_label:{label}"
 
@@ -964,18 +981,31 @@ def _loop_context_summary(loop_events: list[dict[str, object]]) -> str:
         if event_type == "sampled_waypoint_selection":
             selection = event.get("candidate_selection", {})
             lines.append(
-                f"Previous attempt {index}: selected angle_{event.get('selected_angle_deg')} "
+                f"Previous attempt {index}: selected {_loop_event_direction(event)} "
                 f"with candidate details {json.dumps(selection, ensure_ascii=False)}. "
                 f"Failure: {event.get('failure_reason', '')}"
             )
             continue
         verification = event.get("verification")
         lines.append(
-            f"Previous attempt {index}: angle_{event.get('selected_angle_deg')} "
+            f"Previous attempt {index}: {_loop_event_direction(event)} "
             f"target={event.get('waypoint_target')} validation={json.dumps(verification, ensure_ascii=False)} "
             f"failure={event.get('failure_reason', '')}"
         )
     return "\n".join(lines)
+
+
+def _loop_event_direction(event: dict[str, object]) -> str:
+    direction = str(event.get("selected_direction", "")).strip().lower()
+    if direction != "":
+        return direction
+    angle = event.get("selected_angle_deg")
+    if angle is None:
+        return "unknown direction"
+    try:
+        return direction_for_angle(int(angle))
+    except (TypeError, ValueError):
+        return "unknown direction"
 
 
 def _loop_context_blocks(loop_events: list[dict[str, object]]) -> list[dict[str, object]]:

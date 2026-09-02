@@ -17,10 +17,10 @@ from navclaw.agent.visual_policy_decisions import VisualWaypointVerificationDeci
 from navclaw.agent.visual_policy_decisions import normalize_stop_confirmation
 from navclaw.agent.visual_policy_decisions import normalize_visual_action_point
 from navclaw.agent.visual_policy_decisions import normalize_visual_waypoint_verification
-from navclaw.agent.visual_policy_prompt_images import current_panorama_strip_prompt_text
+from navclaw.agent.visual_policy_prompt_images import current_panorama_prompt_text
 from navclaw.agent.visual_policy_prompt_images import image_content_for_array
 from navclaw.agent.visual_policy_prompt_images import image_content_for_movement_history_sheet
-from navclaw.agent.visual_policy_prompt_images import image_content_for_current_panorama_strip
+from navclaw.agent.visual_policy_prompt_images import image_content_for_current_panorama_views
 from navclaw.agent.visual_policy_prompt_images import image_content_for_stop_waypoint_overlay
 from navclaw.agent.visual_policy_prompt_images import image_content_for_view
 from navclaw.agent.visual_policy_prompt_images import selected_view_prompt_text
@@ -124,9 +124,12 @@ Return JSON only:
 
 
 
-_VLN_PROGRESS_NAVIGATION_TOOLS = {
+_VLN_TASK_PROGRESS_TOOLS = {
     "retrieve",
     "update_progress",
+}
+
+_VLN_NAVIGATION_TOOLS = {
     "backtrack",
     "go_to_waypoint",
     "approach_to_stop",
@@ -162,11 +165,111 @@ Progress update rules:
 
 
 
-def decide_vln_progress_navigation_step(
+def decide_vln_task_progress_step(
     *,
     client: "LLMClient",
     cache: "RuntimeCache",
-    goal_text: str,
+    goal_kind: str = GOAL_KIND_VLN_INSTRUCTION,
+    visual_context: VisualActionContext,
+    task_progress: TaskProgressMemory,
+    memory_index_text: str,
+    retrieval_workspace_content: list[dict[str, object]],
+    retrieve_max_rounds: int,
+    retrieve_completed_rounds: int,
+    retrieve_fields_by_ref: dict[str, list[str]],
+    allow_retrieve: bool,
+    allow_update_progress: bool,
+    require_retrieval_conclusion: bool,
+    retrieve_provided_fields_by_ref: dict[str, list[str]] | None = None,
+    progress_context_text: str = "",
+    landmark_panorama_views: dict[int, np.ndarray] | None = None,
+    detected_landmarks_text: str = "",
+    terminal_check_context: dict[str, object] | None = None,
+    task_progress_bev_overlay: np.ndarray | None = None,
+    planning_reference_panorama: bool = False,
+) -> TaskProgressDecision | RetrieveRequest:
+    decision = _run_vln_task_module_prompt(
+        client=client,
+        cache=cache,
+        goal_kind=goal_kind,
+        visual_context=visual_context,
+        task_progress=task_progress,
+        memory_index_text=memory_index_text,
+        retrieval_workspace_content=retrieval_workspace_content,
+        retrieve_max_rounds=retrieve_max_rounds,
+        retrieve_completed_rounds=retrieve_completed_rounds,
+        retrieve_fields_by_ref=retrieve_fields_by_ref,
+        allow_retrieve=allow_retrieve,
+        allow_update_progress=allow_update_progress,
+        allow_navigation_actions=False,
+        require_retrieval_conclusion=require_retrieval_conclusion,
+        retrieve_provided_fields_by_ref=retrieve_provided_fields_by_ref,
+        progress_context_text=progress_context_text,
+        landmark_panorama_views=landmark_panorama_views,
+        detected_landmarks_text=detected_landmarks_text,
+        terminal_check_context=terminal_check_context,
+        task_progress_bev_overlay=task_progress_bev_overlay,
+        planning_reference_panorama=planning_reference_panorama,
+    )
+    if not isinstance(decision, (TaskProgressDecision, RetrieveRequest)):
+        raise TypeError("Task Progress Updater returned a navigation decision")
+    return decision
+
+
+def decide_vln_navigation_step(
+    *,
+    client: "LLMClient",
+    cache: "RuntimeCache",
+    goal_kind: str = GOAL_KIND_VLN_INSTRUCTION,
+    visual_context: VisualActionContext,
+    task_progress: TaskProgressMemory,
+    latest_task_progress: TaskProgressDecision,
+    retrieval_workspace_content: list[dict[str, object]],
+    progress_context_text: str = "",
+    navigation_replan_feedback_text: str = "",
+    landmark_panorama_views: dict[int, np.ndarray] | None = None,
+    detected_landmarks_text: str = "",
+    allowed_backtrack_node_ids: set[str] | None = None,
+    require_backtrack: bool = False,
+    system_owned_waypoint_objective: bool = False,
+    task_progress_bev_overlay: np.ndarray | None = None,
+    planning_reference_panorama: bool = False,
+) -> NavigationModeDecision:
+    decision = _run_vln_task_module_prompt(
+        client=client,
+        cache=cache,
+        goal_kind=goal_kind,
+        visual_context=visual_context,
+        task_progress=task_progress,
+        memory_index_text="",
+        retrieval_workspace_content=retrieval_workspace_content,
+        retrieve_max_rounds=0,
+        retrieve_completed_rounds=0,
+        retrieve_fields_by_ref={},
+        allow_retrieve=False,
+        allow_update_progress=False,
+        allow_navigation_actions=True,
+        require_retrieval_conclusion=False,
+        latest_task_progress=latest_task_progress,
+        progress_context_text=progress_context_text,
+        navigation_replan_feedback_text=navigation_replan_feedback_text,
+        landmark_panorama_views=landmark_panorama_views,
+        detected_landmarks_text=detected_landmarks_text,
+        allowed_backtrack_node_ids=allowed_backtrack_node_ids,
+        require_backtrack=require_backtrack,
+        system_owned_waypoint_objective=system_owned_waypoint_objective,
+        task_progress_bev_overlay=task_progress_bev_overlay,
+        planning_reference_panorama=planning_reference_panorama,
+    )
+    if not isinstance(decision, NavigationModeDecision):
+        raise TypeError("Navigation Planner returned a task-progress decision")
+    return decision
+
+
+def _run_vln_task_module_prompt(
+    *,
+    client: "LLMClient",
+    cache: "RuntimeCache",
     goal_kind: str = GOAL_KIND_VLN_INSTRUCTION,
     visual_context: VisualActionContext,
     task_progress: TaskProgressMemory,
@@ -183,7 +286,7 @@ def decide_vln_progress_navigation_step(
     latest_task_progress: TaskProgressDecision | None = None,
     progress_context_text: str = "",
     navigation_replan_feedback_text: str = "",
-    landmark_panorama_strip: np.ndarray | None = None,
+    landmark_panorama_views: dict[int, np.ndarray] | None = None,
     detected_landmarks_text: str = "",
     allowed_backtrack_node_ids: set[str] | None = None,
     require_backtrack: bool = False,
@@ -195,7 +298,11 @@ def decide_vln_progress_navigation_step(
     if str(goal_kind).strip() != GOAL_KIND_VLN_INSTRUCTION:
         raise ValueError("progress-navigation supports VLN instructions only")
     if not any((allow_retrieve, allow_update_progress, allow_navigation_actions)):
-        raise ValueError("VLN progress-navigation agent has no available tool")
+        raise ValueError("VLN task module has no available operation")
+    if allow_navigation_actions and (allow_retrieve or allow_update_progress):
+        raise ValueError(
+            "Task Progress Updater and Navigation Planner operations cannot share a request"
+        )
     if allow_navigation_actions and latest_task_progress is None:
         raise ValueError("navigation action tools require current task progress")
     if require_backtrack and (
@@ -307,7 +414,7 @@ Retrieval budget for this navigation step:
 RETRIEVE tool:
 - The memory index is a compact text overview of the episode history.
 - Use RETRIEVE to inspect selected visual and movement evidence from that history.
-- A following RETRIEVE query must target the remaining gap.
+- Based on the evidence obtained so far, each subsequent RETRIEVE query must target the historical evidence still needed to determine or justify the current task-progress update.
 - `provided_fields` are already attached in the current planning observation; `available_fields` can be loaded with RETRIEVE.
 - Landmark refs use landmark_<global index>; landmark boxes display only the numeric suffix.
 - node.rgb is a stored node panorama; node.landmarks are detections on that panorama.
@@ -407,23 +514,29 @@ Post-approach terminal check:
 Approach objective:
 {stop_objective}
 """.rstrip()
-    system_prompt = """
-You are a navigation agent.
-Use current observations and retrieve relevant episode evidence when needed to update task progress and select the next navigation action.
+    system_prompt = (
+        """
+You are the Progress-Conditioned Navigation Planner of an embodied navigation agent.
+Use the current observation, updated task-progress state, and retrieval conclusions to select the next high-level navigation action.
+Return JSON only.
 """.strip()
+        if allow_navigation_actions
+        else """
+You are the Task Progress Updater of an embodied navigation agent.
+Use the current observation, task-progress memory, and retrieved episode evidence to resolve progress-relevant evidence gaps and update task progress.
+Return JSON only.
+""".strip()
+    )
     context_text = "\n\n".join(
         section
         for section in (
-            "Navigation task:\n"
-            + str(goal_text).strip()
-            + "\n\nTask progress memory:\n"
+            "Task progress memory:\n"
             + task_progress.format_for_prompt(
                 include_node_bindings=visual_context.graph_context_visible,
                 show_empty_progress_conditions=True,
             ),
             progress_context_section.strip(),
             replan_feedback_section.strip(),
-            landmark_section.strip(),
             terminal_check_section.strip(),
             latest_progress_section.strip(),
         )
@@ -447,11 +560,16 @@ Use current observations and retrieve relevant episode evidence when needed to u
     content: list[dict[str, object]] = [
         {"type": "text", "text": context_text}
     ]
-    panorama_text = current_panorama_strip_prompt_text(
+    if retrieval_catalog_section != "":
+        content.append(
+            {"type": "text", "text": retrieval_catalog_section.strip()}
+        )
+    if landmark_section != "":
+        content.append({"type": "text", "text": landmark_section.strip()})
+    panorama_text = current_panorama_prompt_text(
         visual_context,
         include_visited_nodes=visual_context.graph_context_visible,
         planning_reference=bool(planning_reference_panorama),
-        separate_reference_heading=True,
     )
     if landmark_text != "":
         panorama_text += (
@@ -459,20 +577,15 @@ Use current observations and retrieve relevant episode evidence when needed to u
             "landmark ref."
         )
     content.append({"type": "text", "text": panorama_text})
-    if landmark_panorama_strip is not None:
-        content.append(
-            image_content_for_array(
-                np.asarray(landmark_panorama_strip, dtype=np.uint8)
-            )
+    content.extend(
+        image_content_for_current_panorama_views(
+            cache=cache,
+            views=visual_context.views,
+            include_visited_nodes=visual_context.graph_context_visible,
+            image_overrides_by_angle=landmark_panorama_views,
+            planning_reference=bool(planning_reference_panorama),
         )
-    else:
-        content.append(
-            image_content_for_current_panorama_strip(
-                cache=cache,
-                views=visual_context.views,
-                include_visited_nodes=visual_context.graph_context_visible,
-            )
-        )
+    )
     if task_progress_bev_overlay is not None:
         landmark_bev_text = (
             " Numbered squares are current detected landmarks."
@@ -494,10 +607,6 @@ Use current observations and retrieve relevant episode evidence when needed to u
                     np.asarray(task_progress_bev_overlay, dtype=np.uint8)
                 ),
             ]
-        )
-    if retrieval_catalog_section != "":
-        content.append(
-            {"type": "text", "text": retrieval_catalog_section.strip()}
         )
     if terminal_check_required:
         raw_movement_obs_ids = terminal_check_context.get("rgb_history_obs_ids", [])
@@ -528,23 +637,36 @@ Use current observations and retrieve relevant episode evidence when needed to u
         request_content = list(content)
         if retry_feedback != "":
             request_content.append({"type": "text", "text": retry_feedback})
-        parsed = client.decide_vln_progress_navigation_step(
-            system_prompt,
-            request_content,
+        parsed = (
+            client.decide_vln_navigation_step(system_prompt, request_content)
+            if allow_navigation_actions
+            else client.decide_vln_task_progress_step(
+                system_prompt,
+                request_content,
+            )
         )
         try:
-            return normalize_vln_progress_navigation_step(
+            if allow_navigation_actions:
+                if latest_task_progress is None:
+                    raise ValueError(
+                        "Navigation Planner requires current task progress"
+                    )
+                return normalize_vln_navigation_step(
+                    parsed,
+                    latest_task_progress=latest_task_progress,
+                    allowed_backtrack_node_ids=allowed_backtrack_node_ids,
+                    require_backtrack=require_backtrack,
+                    system_owned_waypoint_objective=(
+                        system_owned_waypoint_objective
+                    ),
+                )
+            return normalize_vln_task_progress_step(
                 parsed,
                 retrieve_fields_by_ref=retrieve_fields_by_ref,
                 retrieve_provided_fields_by_ref=retrieve_provided_fields_by_ref,
                 allow_retrieve=allow_retrieve,
                 allow_update_progress=allow_update_progress,
-                allow_navigation_actions=allow_navigation_actions,
                 require_retrieval_conclusion=require_retrieval_conclusion,
-                latest_task_progress=latest_task_progress,
-                allowed_backtrack_node_ids=allowed_backtrack_node_ids,
-                require_backtrack=require_backtrack,
-                system_owned_waypoint_objective=system_owned_waypoint_objective,
                 require_terminal_check=terminal_check_required,
             )
         except ValueError as exc:
@@ -692,7 +814,58 @@ def _normalize_vln_progress_updates(raw_updates: object) -> list[dict[str, objec
     return normalized
 
 
-def normalize_vln_progress_navigation_step(
+def normalize_vln_task_progress_step(
+    payload: dict[str, object],
+    *,
+    retrieve_fields_by_ref: dict[str, list[str]],
+    allow_retrieve: bool,
+    allow_update_progress: bool,
+    require_retrieval_conclusion: bool,
+    retrieve_provided_fields_by_ref: dict[str, list[str]] | None = None,
+    require_terminal_check: bool = False,
+) -> TaskProgressDecision | RetrieveRequest:
+    decision = _normalize_vln_task_module_step(
+        payload,
+        retrieve_fields_by_ref=retrieve_fields_by_ref,
+        retrieve_provided_fields_by_ref=retrieve_provided_fields_by_ref,
+        allow_retrieve=allow_retrieve,
+        allow_update_progress=allow_update_progress,
+        allow_navigation_actions=False,
+        require_retrieval_conclusion=require_retrieval_conclusion,
+        latest_task_progress=None,
+        require_terminal_check=require_terminal_check,
+    )
+    if not isinstance(decision, (TaskProgressDecision, RetrieveRequest)):
+        raise TypeError("Task Progress Updater normalized a navigation decision")
+    return decision
+
+
+def normalize_vln_navigation_step(
+    payload: dict[str, object],
+    *,
+    latest_task_progress: TaskProgressDecision,
+    allowed_backtrack_node_ids: set[str] | None = None,
+    require_backtrack: bool = False,
+    system_owned_waypoint_objective: bool = False,
+) -> NavigationModeDecision:
+    decision = _normalize_vln_task_module_step(
+        payload,
+        retrieve_fields_by_ref={},
+        allow_retrieve=False,
+        allow_update_progress=False,
+        allow_navigation_actions=True,
+        require_retrieval_conclusion=False,
+        latest_task_progress=latest_task_progress,
+        allowed_backtrack_node_ids=allowed_backtrack_node_ids,
+        require_backtrack=require_backtrack,
+        system_owned_waypoint_objective=system_owned_waypoint_objective,
+    )
+    if not isinstance(decision, NavigationModeDecision):
+        raise TypeError("Navigation Planner normalized a task-progress decision")
+    return decision
+
+
+def _normalize_vln_task_module_step(
     payload: dict[str, object],
     *,
     retrieve_fields_by_ref: dict[str, list[str]],
@@ -707,10 +880,20 @@ def normalize_vln_progress_navigation_step(
     system_owned_waypoint_objective: bool = False,
     require_terminal_check: bool = False,
 ) -> TaskProgressDecision | RetrieveRequest | NavigationModeDecision:
-    selected_tools = [name for name in _VLN_PROGRESS_NAVIGATION_TOOLS if name in payload]
+    module_name = (
+        "Navigation Planner"
+        if allow_navigation_actions
+        else "Task Progress Updater"
+    )
+    module_tools = (
+        _VLN_NAVIGATION_TOOLS
+        if allow_navigation_actions
+        else _VLN_TASK_PROGRESS_TOOLS
+    )
+    selected_tools = [name for name in module_tools if name in payload]
     if len(selected_tools) != 1:
         raise ValueError(
-            "VLN progress-navigation agent must select exactly one tool: "
+            f"{module_name} must select exactly one available operation: "
             f"{payload!r}"
         )
     selected_tool = selected_tools[0]
@@ -733,25 +916,25 @@ def normalize_vln_progress_navigation_step(
         ]
         if len(condition_update_fields) != 1:
             raise ValueError(
-                "VLN progress-navigation agent must return exactly one "
+                "Task Progress Updater must return exactly one "
                 "progress_condition_updates field"
             )
         condition_updates_field = condition_update_fields[0]
         expected_top_fields.add(condition_updates_field)
     if set(payload) != expected_top_fields:
         raise ValueError(
-            "VLN progress-navigation agent returned unexpected top-level fields: "
+            f"{module_name} returned unexpected top-level fields: "
             f"{payload!r}"
         )
     if require_retrieval_conclusion and next(iter(payload)) != "retrieval_conclusion":
         raise ValueError(
-            "VLN progress-navigation agent must write retrieval_conclusion before "
+            "Task Progress Updater must write retrieval_conclusion before "
             f"its next tool: {payload!r}"
         )
     retrieval_conclusion = str(payload.get("retrieval_conclusion", "")).strip()
     if require_retrieval_conclusion and retrieval_conclusion == "":
         raise ValueError(
-            "VLN progress-navigation agent must conclude the latest retrieval "
+            "Task Progress Updater must conclude the latest retrieval "
             f"before its next tool: {payload!r}"
         )
 
@@ -1247,14 +1430,14 @@ Return JSON only:
     content.append(
         {
             "type": "text",
-            "text": current_panorama_strip_prompt_text(
+            "text": current_panorama_prompt_text(
                 visual_context,
                 include_visited_nodes=False,
             ),
         }
     )
-    content.append(
-        image_content_for_current_panorama_strip(
+    content.extend(
+        image_content_for_current_panorama_views(
             cache=cache,
             views=visual_context.views,
             include_visited_nodes=False,

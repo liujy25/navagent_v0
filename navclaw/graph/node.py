@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from navclaw.agent.visual_action_context import angle_for_direction
+from navclaw.agent.visual_action_context import direction_for_angle
+from navclaw.agent.visual_action_context import ordered_panorama_angles
 from navclaw.memory.entity_knowledge import EntityKnowledge
 
 if TYPE_CHECKING:
@@ -138,15 +141,16 @@ def _node_observation_knowledge_specs(
     summary = str(node_summary).strip()
     if summary != "":
         specs.append(("observation_summary", summary))
-    for angle, description in sorted(direction_summaries.items()):
+    for angle in ordered_panorama_angles(list(direction_summaries)):
+        description = direction_summaries[angle]
         text = str(description).strip()
         if text == "":
             continue
         angle_value = int(angle)
         specs.append(
             (
-                f"observation_angle_{angle_value}",
-                f"angle_{angle_value} visible: {text}",
+                f"observation_{direction_for_angle(angle_value)}",
+                f"{direction_for_angle(angle_value)} visible: {text}",
             )
         )
     return specs
@@ -194,6 +198,13 @@ def _normalize_legacy_direction_summaries(value: object) -> dict[int, str]:
     summaries: dict[int, str] = {}
     for angle, description in value.items():
         angle_text = str(angle).strip().lower()
+        try:
+            direction_angle = angle_for_direction(angle_text)
+        except ValueError:
+            direction_angle = None
+        if direction_angle is not None:
+            summaries[int(direction_angle)] = str(description).strip()
+            continue
         if angle_text.startswith("angle_"):
             angle_text = angle_text[len("angle_"):]
         try:

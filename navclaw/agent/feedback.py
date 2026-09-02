@@ -6,6 +6,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from navclaw.agent.actions import AgentAction, AgentActionType
+from navclaw.agent.visual_action_context import direction_for_angle
 
 if TYPE_CHECKING:
     from navclaw.agent.state import NavClawAgentState, NavClawStepState
@@ -81,6 +82,16 @@ def _rgb_history_obs_ids_from_results(step: "NavClawStepState") -> list[str]:
     return obs_ids
 
 
+def _selected_direction(action: AgentAction) -> str | None:
+    angle = action.args.get("selected_angle_deg")
+    if angle is None:
+        return None
+    try:
+        return direction_for_angle(int(angle))
+    except (TypeError, ValueError):
+        return None
+
+
 def _visual_waypoint_feedback(
     *,
     action: AgentAction,
@@ -93,7 +104,7 @@ def _visual_waypoint_feedback(
         feedback_type=AgentFeedbackType.VISUAL_WAYPOINT,
         ok=_execution_ok(step),
         summary={
-            "selected_angle_deg": action.args.get("selected_angle_deg"),
+            "selected_direction": _selected_direction(action),
             "selected_obs_id": action.args.get("selected_obs_id"),
             "target": action.args.get("target"),
             "current_place_node_id": state.current_place_node_id,

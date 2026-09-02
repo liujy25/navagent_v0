@@ -3,14 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from navclaw.agent.visual_action_context import allowed_angles_text
+from navclaw.agent.visual_action_context import allowed_directions_text
+from navclaw.agent.visual_action_context import angle_for_direction
+from navclaw.agent.visual_action_context import direction_for_angle
 from navclaw.agent.visual_action_context import VISUAL_ACTION_ANGLES
 from navclaw.agent.visual_action_context import VisualActionContext
 from navclaw.agent.visual_policy_prompt_images import (
     image_content_for_movement_history_sheet,
-    image_content_for_vertical_transition_panorama_strip,
+    image_content_for_vertical_transition_panorama_views,
 )
-from navclaw.agent.visual_policy_prompt_images import vertical_transition_panorama_strip_prompt_text
 
 if TYPE_CHECKING:
     from navclaw.llm.client import LLMClient
@@ -66,17 +67,17 @@ Decision rules:
   1. If the next-floor walking surface is visible and reachable, choose the nearest reachable point on the first stable floor immediately beyond the final stair tread, before any onward corridor or room travel.
   2. Otherwise, choose the farthest clearly reachable area that continues along the staircase in the requested direction.
   3. If the staircase has not yet been entered, choose a reachable area that approaches or enters its visible entrance.
-- Identify the view containing the selected area and describe one matching reachable waypoint target. Select its angle from {allowed_angles_text(allowed_angles)}.
+- Identify the view containing the selected area and describe one matching reachable waypoint target. Select its direction from {allowed_directions_text(allowed_angles)}.
 - `fail`: no reachable local movement in the current panorama can enter or continue in the requested direction.
 - Briefly state the status judgment in thought. For `continue`, also state why the selected view and target best follow the waypoint priority.
-- For `complete` or `fail`, use an empty waypoint_target and a null selected_angle_deg.
+- For `complete` or `fail`, use an empty waypoint_target and a null selected_direction.
 """.strip()
     output_text = """
 Return JSON only with exactly these fields in this order:
 - thought: string
 - transition_status: one of "complete", "continue", or "fail"
 - waypoint_target: string
-- selected_angle_deg: integer or null
+- selected_direction: one of "front", "back", "left", or "right"; null for complete or fail
 """.strip()
     content = [
         {"type": "text", "text": request_text},
@@ -97,13 +98,10 @@ Return JSON only with exactly these fields in this order:
         blocks=[] if movement_rgb_history_blocks is None else movement_rgb_history_blocks,
     )
     content.extend(
-        [
-            {"type": "text", "text": vertical_transition_panorama_strip_prompt_text(visual_context)},
-            image_content_for_vertical_transition_panorama_strip(
-                cache=cache,
-                views=visual_context.views,
-            ),
-        ]
+        image_content_for_vertical_transition_panorama_views(
+            cache=cache,
+            views=visual_context.views,
+        )
     )
     if isinstance(current_retry_feedback, dict) and current_retry_feedback != {}:
         feedback_text = _vertical_transition_retry_feedback_text(current_retry_feedback)
@@ -144,20 +142,31 @@ def _normalize_vertical_transition_step(
     if transition_status in {"complete", "fail"}:
         waypoint_target = ""
     else:
+        raw_direction = payload.get("selected_direction")
         raw_angle = payload.get("selected_angle_deg")
-        if raw_angle is None:
+        if raw_direction is None and raw_angle is None:
             raise ValueError(
-                f"vertical transition step planner requires selected_angle_deg: {payload!r}"
+                f"vertical transition step planner requires selected_direction: {payload!r}"
             )
-        try:
-            selected_angle = int(raw_angle)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"vertical transition step planner selected unsupported angle: {payload!r}"
-            ) from exc
+        if raw_direction is not None:
+            try:
+                selected_angle = angle_for_direction(raw_direction)
+            except ValueError as exc:
+                raise ValueError(
+                    "vertical transition step planner selected unsupported "
+                    f"direction: {payload!r}"
+                ) from exc
+        else:
+            try:
+                selected_angle = int(raw_angle)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "vertical transition step planner selected unsupported "
+                    f"direction: {payload!r}"
+                ) from exc
         if selected_angle not in valid_angles:
             raise ValueError(
-                f"vertical transition step planner selected unsupported angle: {payload!r}"
+                f"vertical transition step planner selected unsupported direction: {payload!r}"
             )
         if waypoint_target == "":
             raise ValueError(
@@ -228,7 +237,7 @@ def _vertical_transition_retry_feedback_text(feedback: dict[str, object]) -> str
             [
                 "",
                 f"{index}.",
-                f"- rejected view: angle_{int(option['angle_deg'])}",
+                f"- rejected view: {direction_for_angle(int(option['angle_deg']))}",
                 "- rejected target in that view: "
                 + str(option["waypoint_target"]).strip(),
             ]

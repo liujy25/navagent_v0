@@ -11,14 +11,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from navclaw.agent.visual_action_context import ordered_visual_views_left_to_right
-from navclaw.agent.visual_action_context import panorama_angle_order_text
+from navclaw.agent.visual_action_context import ordered_visual_views
 from navclaw.agent.visual_action_context import VisualViewContext
 from navclaw.agent.vln_landmark_context import _landmark_labels_by_id
 from navclaw.agent.vln_landmark_context import _global_landmark_index
-from navclaw.agent.visual_policy_prompt_images import _compose_labeled_image_strip
 from navclaw.agent.visual_policy_prompt_images import image_content_for_array
-from navclaw.agent.visual_policy_prompt_images import image_content_for_current_panorama_strip
+from navclaw.agent.visual_policy_prompt_images import image_content_for_current_panorama_views
 from navclaw.agent.visual_policy_prompt_images import image_content_for_movement_history_sheet
 from navclaw.mapping.exploration.bev_visuals import place_node_marker_style
 from navclaw.mapping.exploration.manager import _densify_path_xy
@@ -120,7 +118,7 @@ class RetrieveRound:
 class _EvidencePanel:
     key: str
     label: str
-    image_content: dict[str, object]
+    content: tuple[dict[str, object], ...]
     source_obs_ids: tuple[str, ...]
 
 
@@ -252,7 +250,7 @@ class RetrievalWorkspace:
         for key in sorted(self.image_panels):
             panel = self.image_panels[key]
             content.append({"type": "text", "text": str(panel.label)})
-            content.append(deepcopy(panel.image_content))
+            content.extend(deepcopy(list(panel.content)))
         return content
 
     def conclusion_context_content(self) -> list[dict[str, object]]:
@@ -873,18 +871,16 @@ def _add_node_rgb_panel(
     if key in workspace.image_panels or obs_ids == []:
         return
     views = _views_for_obs_ids(obs_ids)
-    angles = [int(view.angle_deg) for view in views]
     workspace.image_panels[key] = _EvidencePanel(
         key=key,
-        label=(
-            f"Retrieved node {node_id} panorama RGB.\n"
-            f"- Views are ordered left-to-right as {panorama_angle_order_text(angles)}.\n"
-            f"- Its angle labels use the mapping above relative to the stored heading of node {node_id}."
-        ),
-        image_content=image_content_for_current_panorama_strip(
-            cache=state.cache,
-            views=views,
-            include_visited_nodes=False,
+        label=f"Retrieved node {node_id} panorama RGB.",
+        content=tuple(
+            image_content_for_current_panorama_views(
+                cache=state.cache,
+                views=views,
+                include_visited_nodes=False,
+                label_prefix=f"Retrieved node {node_id} panorama view",
+            )
         ),
         source_obs_ids=tuple(obs_ids),
     )
@@ -916,23 +912,27 @@ def _add_node_landmark_panel(
     if key in workspace.image_panels or selected_candidates == []:
         return []
     obs_ids = [str(obs_id) for obs_id in node.obs_ids]
-    ordered_views = ordered_visual_views_left_to_right(_views_for_obs_ids(obs_ids))
+    ordered_views = ordered_visual_views(_views_for_obs_ids(obs_ids))
     ordered_obs_ids = [str(view.obs_id) for view in ordered_views]
     angles = [int(view.angle_deg) for view in ordered_views]
-    image = _annotated_landmark_sheet(
+    images = _annotated_landmark_images(
         state=state,
         obs_ids=ordered_obs_ids,
         candidates=selected_candidates,
-        image_labels=[f"angle_{angle}" for angle in angles],
     )
+    image_overrides_by_angle = dict(zip(angles, images))
     workspace.image_panels[key] = _EvidencePanel(
         key=key,
-        label=(
-            f"Retrieved landmark detections on node {node_id} panorama RGB.\n"
-            f"- Views are ordered left-to-right as {panorama_angle_order_text(angles)}.\n"
-            f"- Its angle labels use the mapping above relative to the stored heading of node {node_id}."
+        label=f"Retrieved landmark detections on node {node_id} panorama RGB.",
+        content=tuple(
+            image_content_for_current_panorama_views(
+                cache=state.cache,
+                views=ordered_views,
+                include_visited_nodes=False,
+                image_overrides_by_angle=image_overrides_by_angle,
+                label_prefix=f"Retrieved node {node_id} landmark panorama view",
+            )
         ),
-        image_content=image_content_for_array(image),
         source_obs_ids=tuple(obs_ids),
     )
     return obs_ids
@@ -953,7 +953,7 @@ def _add_landmark_rgb_panel(
             obs_ids.append(obs_id)
     if key in workspace.image_panels or obs_ids == []:
         return obs_ids
-    image = _annotated_landmark_sheet(
+    images = _annotated_landmark_images(
         state=state,
         obs_ids=obs_ids,
         candidates=[candidate],
@@ -961,7 +961,17 @@ def _add_landmark_rgb_panel(
     workspace.image_panels[key] = _EvidencePanel(
         key=key,
         label=f"Retrieved RGB evidence for {candidate.get('landmark_id', '')}.",
-        image_content=image_content_for_array(image),
+        content=tuple(
+            block
+            for index, image in enumerate(images, start=1)
+            for block in (
+                {
+                    "type": "text",
+                    "text": f"Retrieved landmark evidence image {index}.",
+                },
+                image_content_for_array(image),
+            )
+        ),
         source_obs_ids=tuple(obs_ids),
     )
     return obs_ids
@@ -983,7 +993,7 @@ def _add_movement_panel(
     workspace.image_panels[key] = _EvidencePanel(
         key=key,
         label=f"Retrieved chronological movement RGB for edge {edge_id}.",
-        image_content=content,
+        content=(content,),
         source_obs_ids=tuple(obs_ids),
     )
 
@@ -1015,7 +1025,7 @@ def _add_edge_rgb_panel(
             f"{dst_node.id}; the blue line is the executed path and the numbered "
             "node marker is the endpoint."
         ),
-        image_content=image_content_for_array(image),
+        content=(image_content_for_array(image),),
         source_obs_ids=(str(obs_id),),
     )
     return [str(obs_id)]
@@ -1139,16 +1149,14 @@ def _contiguous_projected_runs(
     return runs
 
 
-def _annotated_landmark_sheet(
+def _annotated_landmark_images(
     *,
     state: "NavClawAgentState",
     obs_ids: list[str],
     candidates: list[dict[str, object]],
-    image_labels: list[str] | None = None,
-) -> np.ndarray:
+) -> list[np.ndarray]:
     images: list[np.ndarray] = []
-    labels: list[str] = []
-    for index, obs_id in enumerate(obs_ids):
+    for obs_id in obs_ids:
         raw = np.asarray(state.cache.get_observation(str(obs_id)).observation.rgb, dtype=np.uint8)
         canvas = Image.fromarray(raw).convert("RGB")
         draw = ImageDraw.Draw(canvas)
@@ -1171,12 +1179,7 @@ def _annotated_landmark_sheet(
                     font=font,
                 )
         images.append(np.asarray(canvas, dtype=np.uint8))
-        labels.append(
-            str(image_labels[index])
-            if image_labels is not None and index < len(image_labels)
-            else str(obs_id)
-        )
-    return _compose_labeled_image_strip(images=images, labels=labels)
+    return images
 
 
 def _views_for_obs_ids(obs_ids: list[str]) -> list[VisualViewContext]:

@@ -3,13 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PIL import Image
-from PIL import ImageDraw
-from PIL import ImageFont
 
-from navclaw.agent.visual_action_context import angle_convention_text
-from navclaw.agent.visual_action_context import ordered_visual_views_left_to_right
-from navclaw.agent.visual_action_context import panorama_angle_order_text
+from navclaw.agent.visual_action_context import direction_for_angle
+from navclaw.agent.visual_action_context import ordered_visual_views
 from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext
 from navclaw.llm.image_preprocessing import compose_llm_image_tile_sheet
 from navclaw.llm.image_preprocessing import encode_rgb_to_jpeg_data_url
@@ -24,106 +20,86 @@ if TYPE_CHECKING:
     from navclaw.runtime.cache import RuntimeCache
 
 
-PANORAMA_STRIP_SEPARATOR_WIDTH_PX = 10
-
-
-def current_panorama_strip_prompt_text(
+def current_panorama_prompt_text(
     visual_context: VisualActionContext,
     *,
     include_visited_nodes: bool = True,
     planning_reference: bool = False,
-    separate_reference_heading: bool = False,
 ) -> str:
-    angles = visual_context.available_angles
     if planning_reference:
         node_role = "Current planning node"
-        heading_reference = (
-            f"the stored heading of planning node {visual_context.current_node_id}"
-        )
     else:
         node_role = "Current graph node"
-        heading_reference = "the current robot heading"
     visited_nodes_section = (
         _visible_visited_nodes_section(visual_context)
         if include_visited_nodes
         else ""
     )
-    if separate_reference_heading:
-        angle_text = angle_convention_text(
-            angles,
-            heading_reference="each panorama's reference heading",
-        )
-        reference_heading_text = (
-            f"- The reference heading for this current panorama is {heading_reference}."
-        )
-    else:
-        angle_text = angle_convention_text(
-            angles,
-            heading_reference=heading_reference,
-        )
-        reference_heading_text = ""
-    reference_heading_line = (
-        f"{reference_heading_text}\n" if reference_heading_text != "" else ""
-    )
     return f"""
-Current panorama strip:
-- {node_role}: {visual_context.current_node_id}.
-- Views are ordered left-to-right as {panorama_angle_order_text(angles)}.
-- {angle_text}
-{reference_heading_line}- Angle labels are view labels, not scene objects.
+{node_role}: {visual_context.current_node_id}.
 {visited_nodes_section}
-""".strip()
-
-
-def vertical_transition_panorama_strip_prompt_text(visual_context: VisualActionContext) -> str:
-    angles = visual_context.available_angles
-    return f"""
-Current panorama:
-- Views are ordered left-to-right as {panorama_angle_order_text(angles)}.
-- {angle_convention_text(angles)}
-- Angle labels are labels, not scene objects.
 """.strip()
 
 
 def selected_view_prompt_text(view: VisualViewContext) -> str:
     visited_nodes_section = _visible_visited_nodes_for_view_section(view)
     return f"""
-Selected RGB image for angle_{int(view.angle_deg)}:
+Selected RGB image for {direction_for_angle(view.angle_deg)}:
 - The attached image is the selected view for marking a reachable local waypoint.
 {visited_nodes_section}
 """.strip()
 
 
-def image_content_for_current_panorama_strip(
+def image_content_for_current_panorama_views(
     *,
     cache: "RuntimeCache",
     views: list[VisualViewContext],
     include_visited_nodes: bool = True,
-) -> dict[str, object]:
-    ordered_views = ordered_visual_views_left_to_right(views)
-    images = [
-        (
-            _image_array_for_view(cache=cache, view=view)
-            if include_visited_nodes
-            else _image_array_for_obs(cache=cache, obs_id=view.obs_id)
+    image_overrides_by_angle: dict[int, np.ndarray] | None = None,
+    planning_reference: bool = False,
+    label_prefix: str | None = None,
+) -> list[dict[str, object]]:
+    content: list[dict[str, object]] = []
+    overrides = {
+        int(angle) % 360: np.asarray(image, dtype=np.uint8)
+        for angle, image in (image_overrides_by_angle or {}).items()
+    }
+    for view in ordered_visual_views(views):
+        angle = int(view.angle_deg) % 360
+        image = (
+            overrides[angle]
+            if angle in overrides
+            else (
+                _image_array_for_view(cache=cache, view=view)
+                if include_visited_nodes
+                else _image_array_for_obs(cache=cache, obs_id=view.obs_id)
+            )
         )
-        for view in ordered_views
-    ]
-    labels = [f"angle_{int(view.angle_deg)}" for view in ordered_views]
-    strip = _compose_labeled_image_strip(images=images, labels=labels)
-    return image_content_for_array(strip)
+        direction = direction_for_angle(angle)
+        if label_prefix is None:
+            view_label = (
+                f"Current planner {direction} view:"
+                if planning_reference
+                else f"Current {direction} view:"
+            )
+        else:
+            view_label = f"{label_prefix}: {direction}."
+        content.append({"type": "text", "text": view_label})
+        content.append(image_content_for_camera_array(image))
+    return content
 
 
-def image_content_for_vertical_transition_panorama_strip(
+def image_content_for_vertical_transition_panorama_views(
     *,
     cache: "RuntimeCache",
     views: list[VisualViewContext],
-) -> dict[str, object]:
-    ordered_views = ordered_visual_views_left_to_right(views)
-    images = [_image_array_for_obs(cache=cache, obs_id=view.obs_id) for view in ordered_views]
-    labels = [f"angle_{int(view.angle_deg)}" for view in ordered_views]
-    strip = _compose_labeled_image_strip(images=images, labels=labels)
-    return image_content_for_array(strip)
+) -> list[dict[str, object]]:
+    return image_content_for_current_panorama_views(
+        cache=cache,
+        views=views,
+        include_visited_nodes=False,
+        label_prefix="Current vertical-transition panorama view",
+    )
 
 
 def image_content_for_view(*, cache: "RuntimeCache", view: VisualViewContext) -> dict[str, object]:
@@ -201,11 +177,13 @@ def _point_2d_from_pending_stop(pending_stop: dict[str, object]) -> list[float] 
 
 def _visible_visited_nodes_text(visual_context: VisualActionContext) -> str:
     lines: list[str] = []
-    for view in visual_context.views:
+    for view in ordered_visual_views(visual_context.views):
         node_items = [_visited_node_label_mapping(node_id) for node_id in view.visible_visited_nodes]
         if node_items == []:
             continue
-        lines.append(f"angle_{int(view.angle_deg)}: {', '.join(node_items)}")
+        lines.append(
+            f"{direction_for_angle(view.angle_deg)}: {', '.join(node_items)}"
+        )
     return "\n".join(lines)
 
 
@@ -263,91 +241,3 @@ def _image_array_for_view(*, cache: "RuntimeCache", view: VisualViewContext) -> 
 def _image_array_for_obs(*, cache: "RuntimeCache", obs_id: str) -> np.ndarray:
     observation = cache.get_observation(str(obs_id)).observation
     return np.asarray(observation.rgb)
-
-
-def _compose_labeled_image_strip(
-    *,
-    images: list[np.ndarray],
-    labels: list[str],
-) -> np.ndarray:
-    if images == []:
-        raise ValueError("panorama strip requires at least one image")
-    if len(images) != len(labels):
-        raise ValueError("panorama strip images and labels must have the same length")
-
-    resized_images = [
-        resize_rgb_to_fit(image, max_size=LLM_CAMERA_IMAGE_MAX_SIZE).image
-        for image in images
-    ]
-    first = normalize_rgb_array(resized_images[0])
-    tile_height = int(first.shape[0])
-    tile_width = int(first.shape[1])
-    label_height = max(40, int(round(float(tile_height) * 0.09)))
-    tile_count = int(len(images))
-    separator_width = int(PANORAMA_STRIP_SEPARATOR_WIDTH_PX)
-    canvas = np.full(
-        (
-            tile_height + label_height,
-            tile_width * tile_count + separator_width * (tile_count - 1),
-            3,
-        ),
-        255,
-        dtype=np.uint8,
-    )
-    font = _strip_label_font(tile_height)
-    for index, (raw_image, label) in enumerate(zip(resized_images, labels)):
-        rgb = normalize_rgb_array(raw_image)
-        if int(rgb.shape[0]) != tile_height or int(rgb.shape[1]) != tile_width:
-            rgb = np.asarray(
-                Image.fromarray(rgb).resize(
-                    (tile_width, tile_height),
-                    Image.Resampling.LANCZOS,
-                ),
-                dtype=np.uint8,
-            )
-        x0 = index * (tile_width + separator_width)
-        x1 = x0 + tile_width
-        canvas[:tile_height, x0:x1] = rgb
-        if index < tile_count - 1:
-            sep_x0 = x1
-            sep_x1 = min(sep_x0 + separator_width, canvas.shape[1])
-            canvas[:, sep_x0:sep_x1] = np.asarray([0, 0, 0], dtype=np.uint8)
-        _draw_centered_label(
-            canvas=canvas,
-            label=str(label),
-            x0=x0,
-            x1=x1,
-            y0=tile_height,
-            y1=tile_height + label_height,
-            font=font,
-        )
-    return canvas
-
-
-def _strip_label_font(tile_height: int) -> ImageFont.ImageFont:
-    font_size = max(18, int(round(float(tile_height) * 0.045)))
-    try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", size=font_size)
-    except OSError:
-        return ImageFont.load_default()
-
-
-def _draw_centered_label(
-    *,
-    canvas: np.ndarray,
-    label: str,
-    x0: int,
-    x1: int,
-    y0: int,
-    y1: int,
-    font: ImageFont.ImageFont,
-) -> None:
-    image = Image.fromarray(canvas)
-    draw = ImageDraw.Draw(image)
-    bbox = draw.textbbox((0, 0), str(label), font=font)
-    text_width = int(bbox[2] - bbox[0])
-    text_height = int(bbox[3] - bbox[1])
-    text_x = int(x0 + max(0, (int(x1) - int(x0) - text_width) // 2))
-    text_y = int(y0 + max(0, (int(y1) - int(y0) - text_height) // 2))
-    draw.text((text_x, text_y), str(label), fill=(0, 0, 0), font=font)
-    canvas[:, :, :] = np.asarray(image, dtype=np.uint8)

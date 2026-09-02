@@ -17,9 +17,11 @@ from navclaw.agent.episodic_retrieval import memory_index_text
 from navclaw.agent.node_summary import NodeSummaryDecision, summarize_current_node
 from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext, build_visual_action_context
 from navclaw.agent.visual_action_context import build_visual_action_context_for_node
+from navclaw.agent.visual_action_context import direction_for_angle
 from navclaw.agent.visual_grounding import VisualWaypoint
 from navclaw.agent.visual_policy import decide_stop_confirmation
-from navclaw.agent.visual_policy import decide_vln_progress_navigation_step
+from navclaw.agent.visual_policy import decide_vln_navigation_step
+from navclaw.agent.visual_policy import decide_vln_task_progress_step
 from navclaw.agent.visual_policy import ensure_task_progress_memory
 from navclaw.agent.visual_policy_decisions import LocalMovePlanDecision
 from navclaw.agent.visual_policy_decisions import NavigationModeDecision
@@ -27,7 +29,7 @@ from navclaw.agent.visual_policy_decisions import TaskProgressDecision
 from navclaw.agent.visual_policy_decisions import VisualActionPointDecision
 from navclaw.agent.visual_policy_decisions import VisualWaypointVerificationDecision
 from navclaw.agent.vln_landmark_context import build_vln_landmark_context
-from navclaw.agent.vln_landmark_context import draw_vln_landmark_panorama_strip
+from navclaw.agent.vln_landmark_context import draw_vln_landmark_panorama_views
 from navclaw.agent.vln_waypoint_policy import plan_vln_waypoint_loop
 from navclaw.agent.vln_waypoint_sampling import VLN_STOP_WAYPOINT_MAX_DISTANCE_M
 from navclaw.agent.vln_waypoint_sampling import VLN_STOP_WAYPOINT_SAMPLE_SPACING_M
@@ -320,13 +322,23 @@ def _navigation_replan_feedback_text(feedback: list[dict[str, object]]) -> str:
         for output_name, input_name in (
             ("reference_node_id", "reference_node_id"),
             ("stop_objective", "stop_objective"),
-            ("selected_angle_deg", "selected_angle_deg"),
             ("waypoint_target", "waypoint_target"),
             ("validation_result", "verifier_verdict"),
         ):
             value = item.get(input_name)
             if value is not None and str(value).strip() != "":
                 fields.append(f"{output_name}={value}")
+        selected_direction = str(item.get("selected_direction", "")).strip()
+        selected_angle = item.get("selected_angle_deg")
+        if selected_direction != "":
+            fields.append(f"selected_direction={selected_direction}")
+        elif selected_angle is not None:
+            try:
+                fields.append(
+                    f"selected_direction={direction_for_angle(int(selected_angle))}"
+                )
+            except (TypeError, ValueError):
+                pass
         if "target_not_visible" in item:
             fields.append(
                 f"target_not_visible={bool(item.get('target_not_visible', False))}"
@@ -356,7 +368,7 @@ def _fallback_navigation_feedback(
     return {
         "action_mode": str(navigation_mode.action_mode),
         "stop_objective": str(navigation_mode.stop_objective),
-        "selected_angle_deg": int(selected_view.angle_deg),
+        "selected_direction": direction_for_angle(selected_view.angle_deg),
         "selected_obs_id": str(selected_view.obs_id),
         "waypoint_target": str(waypoint_target),
         "local_move_reasoning": str(local_move_plan.reasoning),
@@ -537,19 +549,12 @@ def _vln_backtrack_context_content(
 
 def _vln_waypoint_inherited_agent_context(
     *,
-    goal_text: str = "",
     context_loop: EpisodicRetrievalLoopResult | None,
     task_progress: TaskProgressDecision,
     navigation_mode: NavigationModeDecision,
     active_progress_item: str = "",
     task_progress_text: str = "",
 ) -> list[dict[str, object]]:
-    navigation_task = str(goal_text).strip()
-    navigation_task_section = (
-        f"Navigation task:\n{navigation_task}\n\n"
-        if navigation_task != ""
-        else ""
-    )
     active_item = str(active_progress_item).strip()
     progress = context_loop.task_progress_decision if context_loop is not None else task_progress
     navigation_action: dict[str, object] = {
@@ -615,7 +620,6 @@ def _vln_waypoint_inherited_agent_context(
             "type": "text",
             "text": (
                 "Navigation step context:\n"
-                f"{navigation_task_section}"
                 f"{progress_memory_section}"
                 f"{active_item_section}"
                 f"{retrieval_section}"
@@ -899,8 +903,8 @@ def run_episodic_retrieval_loop(
             planning_landmark_context is not None
             and list(planning_landmark_context.evidences) != []
         )
-        landmark_panorama_strip = (
-            draw_vln_landmark_panorama_strip(
+        landmark_panorama_views = (
+            draw_vln_landmark_panorama_views(
                 cache=state.cache,
                 visual_context=planning_visual_context,
                 evidences=planning_landmark_context.evidences,
@@ -953,60 +957,81 @@ def run_episodic_retrieval_loop(
             *retrieval_context_content,
             *_vln_backtrack_context_content(backtrack_contexts),
         ]
-        decision = decide_vln_progress_navigation_step(
-            client=state.llm_client,
-            cache=state.cache,
-            goal_text=goal_text,
-            goal_kind=goal_kind,
-            visual_context=planning_visual_context,
-            task_progress=task_progress_memory,
-            memory_index_text=loop_index_text if allow_retrieve else "",
-            retrieval_workspace_content=retrieval_context_content,
-            retrieve_max_rounds=(
-                int(workspace.max_retrieve_rounds)
-                if allow_retrieve
-                else 0
-            ),
-            retrieve_completed_rounds=(
-                int(workspace.retrieve_count) if allow_retrieve else 0
-            ),
-            retrieve_fields_by_ref=loop_fields_by_ref if allow_retrieve else {},
-            retrieve_provided_fields_by_ref=(
-                provided_fields_by_ref if allow_retrieve else {}
-            ),
-            allow_retrieve=allow_retrieve,
-            allow_update_progress=not progress_is_current,
-            allow_navigation_actions=progress_is_current,
-            require_retrieval_conclusion=workspace.has_pending_evidence,
-            latest_task_progress=task_progress_decision,
-            progress_context_text="\n\n".join(
-                item
-                for item in (
-                    _vln_initial_progress_note(
-                        goal_kind=goal_kind,
-                        step_index=int(step.place_step_index),
-                    ),
-                )
-                if item != ""
-            ),
-            landmark_panorama_strip=landmark_panorama_strip,
-            detected_landmarks_text=detected_landmarks_text,
-            task_progress_bev_overlay=None,
-            allowed_backtrack_node_ids=allowed_backtrack_node_ids,
-            require_backtrack=False,
-            system_owned_waypoint_objective=_uses_system_active_waypoint_grounding(
-                goal_kind=_goal_kind(goal),
-            ),
-            terminal_check_context=(
-                pending_terminal_check
-                if terminal_check_required and not progress_is_current
-                else None
-            ),
-            planning_reference_panorama=(
-                str(planning_visual_context.current_node_id)
-                != str(physical_visual_context.current_node_id)
-            ),
+        progress_context_text = "\n\n".join(
+            item
+            for item in (
+                _vln_initial_progress_note(
+                    goal_kind=goal_kind,
+                    step_index=int(step.place_step_index),
+                ),
+            )
+            if item != ""
         )
+        planning_reference_panorama = (
+            str(planning_visual_context.current_node_id)
+            != str(physical_visual_context.current_node_id)
+        )
+        if progress_is_current:
+            if task_progress_decision is None:
+                raise ValueError(
+                    "Navigation Planner requires the latest task-progress update"
+                )
+            decision = decide_vln_navigation_step(
+                client=state.llm_client,
+                cache=state.cache,
+                goal_kind=goal_kind,
+                visual_context=planning_visual_context,
+                task_progress=task_progress_memory,
+                latest_task_progress=task_progress_decision,
+                retrieval_workspace_content=retrieval_context_content,
+                progress_context_text=progress_context_text,
+                landmark_panorama_views=landmark_panorama_views,
+                detected_landmarks_text=detected_landmarks_text,
+                allowed_backtrack_node_ids=allowed_backtrack_node_ids,
+                require_backtrack=False,
+                system_owned_waypoint_objective=(
+                    _uses_system_active_waypoint_grounding(
+                        goal_kind=_goal_kind(goal),
+                    )
+                ),
+                task_progress_bev_overlay=None,
+                planning_reference_panorama=planning_reference_panorama,
+            )
+        else:
+            decision = decide_vln_task_progress_step(
+                client=state.llm_client,
+                cache=state.cache,
+                goal_kind=goal_kind,
+                visual_context=planning_visual_context,
+                task_progress=task_progress_memory,
+                memory_index_text=loop_index_text if allow_retrieve else "",
+                retrieval_workspace_content=retrieval_context_content,
+                retrieve_max_rounds=(
+                    int(workspace.max_retrieve_rounds)
+                    if allow_retrieve
+                    else 0
+                ),
+                retrieve_completed_rounds=(
+                    int(workspace.retrieve_count) if allow_retrieve else 0
+                ),
+                retrieve_fields_by_ref=(
+                    loop_fields_by_ref if allow_retrieve else {}
+                ),
+                retrieve_provided_fields_by_ref=(
+                    provided_fields_by_ref if allow_retrieve else {}
+                ),
+                allow_retrieve=allow_retrieve,
+                allow_update_progress=True,
+                require_retrieval_conclusion=workspace.has_pending_evidence,
+                progress_context_text=progress_context_text,
+                landmark_panorama_views=landmark_panorama_views,
+                detected_landmarks_text=detected_landmarks_text,
+                terminal_check_context=(
+                    pending_terminal_check if terminal_check_required else None
+                ),
+                task_progress_bev_overlay=None,
+                planning_reference_panorama=planning_reference_panorama,
+            )
         if isinstance(decision, RetrieveRequest):
             condition_update_result = task_progress_memory.apply_condition_updates(
                 list(decision.progress_condition_updates),
@@ -1293,14 +1318,12 @@ def plan_visual_navigation_action(
                     )
                     - rejected_backtrack_anchor_node_ids
                 )
-                navigation_mode = decide_vln_progress_navigation_step(
+                navigation_mode = decide_vln_navigation_step(
                     client=state.llm_client,
                     cache=state.cache,
-                    goal_text=goal_text,
                     goal_kind=_goal_kind(goal),
                     visual_context=planning_visual_context,
                     task_progress=task_progress_memory,
-                    memory_index_text="",
                     retrieval_workspace_content=(
                         [
                             *(
@@ -1311,19 +1334,12 @@ def plan_visual_navigation_action(
                             *_vln_backtrack_context_content(backtrack_contexts),
                         ]
                     ),
-                    retrieve_max_rounds=0,
-                    retrieve_completed_rounds=int(workspace.retrieve_count),
-                    retrieve_fields_by_ref={},
-                    allow_retrieve=False,
-                    allow_update_progress=False,
-                    allow_navigation_actions=True,
-                    require_retrieval_conclusion=False,
                     latest_task_progress=task_progress_decision,
                     navigation_replan_feedback_text=_navigation_replan_feedback_text(
                         navigation_replan_feedback
                     ),
-                    landmark_panorama_strip=(
-                        draw_vln_landmark_panorama_strip(
+                    landmark_panorama_views=(
+                        draw_vln_landmark_panorama_views(
                             cache=state.cache,
                             visual_context=planning_visual_context,
                             evidences=vln_landmark_context.evidences,
@@ -1347,10 +1363,6 @@ def plan_visual_navigation_action(
                         != str(physical_visual_context.current_node_id)
                     ),
                 )
-                if not isinstance(navigation_mode, NavigationModeDecision):
-                    raise ValueError(
-                        "VLN progress-navigation replan must return a navigation action"
-                    )
                 step.episodic_retrieval["final_navigation_mode"] = (
                     navigation_mode.to_dict()
                 )
@@ -1444,7 +1456,6 @@ def plan_visual_navigation_action(
                 context_active_progress_item if use_system_active_progress else ""
             )
             inherited_agent_context_content = _vln_waypoint_inherited_agent_context(
-                goal_text=goal_text,
                 context_loop=episodic_context_loop,
                 task_progress=task_progress_decision,
                 navigation_mode=navigation_mode,
@@ -1955,9 +1966,9 @@ def _waypoint_selection_text_for_node(
         return f"Previous selection at reference_node_id {planner_node_id}: none."
     angle = context.get("selected_angle_deg")
     try:
-        angle_text = f"angle_{int(angle)}"
+        direction_text = direction_for_angle(int(angle))
     except (TypeError, ValueError):
-        angle_text = "angle_unknown"
+        direction_text = "unknown direction"
     kind = str(context.get("selection_kind", "waypoint")).strip() or "waypoint"
     selected_label = context.get("selected_label")
     label_text = ""
@@ -1966,7 +1977,7 @@ def _waypoint_selection_text_for_node(
             label_text = f" label {int(selected_label)}"
         except (TypeError, ValueError):
             label_text = ""
-    selection = f"{angle_text} {kind}{label_text}".strip()
+    selection = f"{direction_text} {kind}{label_text}".strip()
     return (
         f"previous_selection: {selection}; "
         f"replan_reason: {str(recovery_reason).strip() or 'none'}"

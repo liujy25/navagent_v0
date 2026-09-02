@@ -22,7 +22,14 @@ At every place step the agent:
 4. summarizes the current node and stores landmark evidence;
 5. builds a text memory index over historical nodes, movement edges, and
    landmarks;
-6. runs a bounded progress/retrieval/navigation loop.
+6. runs the Task Progress Updater with bounded retrieval, then runs the
+   Progress-Conditioned Navigation Planner.
+
+The original instruction is used to initialize ordered task-progress memory.
+Later updater and planner calls use that progress state instead of repeating the
+raw instruction. Each model-facing panorama is supplied as four independent
+images in the fixed order front, back, left, and right; angles remain an
+internal geometry representation.
 
 The current panorama and current landmark detections are base observations.
 Historical RGB, edge trajectory/movement RGB, landmark crops, and graph BEV are
@@ -30,14 +37,15 @@ loaded only through `RETRIEVE`. A retrieval request may ask for multiple refs
 and fields; each follow-up round must target remaining evidence. The maximum is
 eight rounds per place step.
 
-After the model concludes retrieval, it updates task progress. If retrieval
-occurred, the Knowledge Manager consolidates reusable entity knowledge back
-into graph nodes, edges, or landmarks. This does not change task-progress
-state.
+After the Task Progress Updater concludes retrieval, it updates task progress.
+The independent Navigation Planner then selects one high-level action from the
+updated state and retrieval conclusions. If retrieval occurred, the Knowledge
+Manager consolidates reusable entity knowledge back into graph nodes, edges,
+or landmarks. This does not change task-progress state.
 
 ## Navigation actions
 
-The progress-navigation model selects exactly one of:
+The Progress-Conditioned Navigation Planner selects exactly one of:
 
 - `GO_TO_WAYPOINT`: ground the current active progress item to an FSS candidate;
 - `BACKTRACK`: use a stored prior-node panorama as the planning reference while

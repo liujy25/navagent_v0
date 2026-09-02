@@ -3,7 +3,7 @@
 NavAgent v0 is the robot-facing release of the canonical NavClaw visual
 language navigation (VLN) agent. It contains one algorithm configuration:
 
-- modular progress/retrieval/navigation reasoning;
+- independent task-progress updating and progress-conditioned navigation;
 - active episodic retrieval with up to eight rounds per place step;
 - entity knowledge consolidation after retrieval;
 - graph-aware backtracking and stop confirmation;
@@ -55,8 +55,10 @@ For an OpenAI-compatible provider, also set `OPENAI_BASE_URL` or pass
 module; there are no hidden VA/LA model overrides.
 
 By default the agent captures four RGB-D views facing front, left, back, and
-right, separated by 90-degree left turns. The bridge and robot controller must
-return to the original heading after the fourth turn.
+right, separated by 90-degree left turns. The physical capture order is front,
+left, back, right; prompts present the four images independently in the fixed
+front, back, left, right order. The bridge and robot controller must return to
+the original heading after the fourth turn.
 
 ## Robot API
 

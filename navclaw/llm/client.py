@@ -240,9 +240,18 @@ class LLMClient:
             retry_count=5,
         )
 
-    def decide_vln_progress_navigation_step(self, system_prompt, user_prompt):
+    def decide_vln_task_progress_step(self, system_prompt, user_prompt):
         return self._call(
-            "vln_progress_navigation_agent",
+            "vln_task_progress_updater",
+            system_prompt,
+            user_prompt,
+            max_new_tokens=8192,
+            retry_count=5,
+        )
+
+    def decide_vln_navigation_step(self, system_prompt, user_prompt):
+        return self._call(
+            "vln_progress_conditioned_navigation_planner",
             system_prompt,
             user_prompt,
             max_new_tokens=8192,

@@ -960,7 +960,7 @@ def _vertical_waypoint_geometry_warning(
             f"(waypoint_z={waypoint_height:.3f}m, current_z={float(current_height_m):.3f}m, "
             f"delta={height_delta:+.3f}m). The requested vertical transition is Go down stairs, "
             "so the waypoint may be on an upward or opposite-direction path. "
-            "Reconsider the selected angle or local waypoint region for the requested downward transition."
+            "Reconsider the selected direction or local waypoint region for the requested downward transition."
         )
     if direction == "up" and height_delta < -tolerance:
         return (
@@ -968,7 +968,7 @@ def _vertical_waypoint_geometry_warning(
             f"(waypoint_z={waypoint_height:.3f}m, current_z={float(current_height_m):.3f}m, "
             f"delta={height_delta:+.3f}m). The requested vertical transition is Go upstairs, "
             "so the waypoint may be on a downward or opposite-direction path. "
-            "Reconsider the selected angle or local waypoint region for the requested upward transition."
+            "Reconsider the selected direction or local waypoint region for the requested upward transition."
         )
     return ""
 

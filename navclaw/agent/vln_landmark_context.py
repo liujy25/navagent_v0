@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from navclaw.agent.visual_action_context import ordered_panorama_angles_left_to_right
-from navclaw.agent.visual_action_context import ordered_visual_views_left_to_right
+from navclaw.agent.visual_action_context import direction_for_angle
+from navclaw.agent.visual_action_context import ordered_panorama_angles
+from navclaw.agent.visual_action_context import ordered_visual_views
 from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext
-from navclaw.agent.visual_policy_prompt_images import _compose_labeled_image_strip
 from navclaw.agent.visual_policy_prompt_images import _image_array_for_view
 from navclaw.llm.image_preprocessing import LLM_CAMERA_IMAGE_MAX_SIZE
 from navclaw.llm.image_preprocessing import resize_rgb_to_fit
@@ -124,15 +124,14 @@ def _landmark_context_text(
     return "\n\n".join(section for section in sections if section.strip() != "")
 
 
-def draw_vln_landmark_panorama_strip(
+def draw_vln_landmark_panorama_views(
     *,
     cache: "RuntimeCache",
     visual_context: VisualActionContext,
     evidences: list[VlnLandmarkEvidence],
-) -> np.ndarray:
-    images: list[np.ndarray] = []
-    labels: list[str] = []
-    for view in ordered_visual_views_left_to_right(visual_context.views):
+) -> dict[int, np.ndarray]:
+    images_by_angle: dict[int, np.ndarray] = {}
+    for view in ordered_visual_views(visual_context.views):
         raw_rgb = np.asarray(_image_array_for_view(cache=cache, view=view), dtype=np.uint8)
         resized = resize_rgb_to_fit(raw_rgb, max_size=LLM_CAMERA_IMAGE_MAX_SIZE)
         image = np.asarray(resized.image, dtype=np.uint8)
@@ -142,9 +141,8 @@ def draw_vln_landmark_panorama_strip(
             view=view,
             evidences=evidences,
         )
-        images.append(image)
-        labels.append(f"angle_{int(view.angle_deg)}")
-    return _compose_labeled_image_strip(images=images, labels=labels)
+        images_by_angle[int(view.angle_deg) % 360] = image
+    return images_by_angle
 
 
 def draw_vln_landmarks_on_view_image(
@@ -273,7 +271,7 @@ def _detected_landmarks_by_view_text(
     lines = [
         "Detected landmarks by view (canonical refs; boxes show their numeric suffixes):"
     ]
-    for angle_value in ordered_panorama_angles_left_to_right(visual_context.available_angles):
+    for angle_value in ordered_panorama_angles(visual_context.available_angles):
         items = sorted(by_angle.get(int(angle_value), []), key=lambda item: int(item.display_label or 10**9))
         item_text = ", ".join(
             f"{item.landmark_id} {item.class_name} confidence={float(item.score):.2f}"
@@ -281,7 +279,7 @@ def _detected_landmarks_by_view_text(
             if str(item.landmark_id).strip() != ""
         )
         if item_text != "":
-            lines.append(f"- angle_{int(angle_value)}: {item_text}")
+            lines.append(f"- {direction_for_angle(angle_value)}: {item_text}")
     return "\n".join(lines)
 
 
