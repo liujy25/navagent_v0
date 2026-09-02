@@ -54,9 +54,9 @@ For an OpenAI-compatible provider, also set `OPENAI_BASE_URL` or pass
 `--base-url`. The `--model` value is used by every language and visual-language
 module; there are no hidden VA/LA model overrides.
 
-By default the agent captures six RGB-D views separated by 60-degree left
-turns. The bridge and robot controller must return to the original heading
-after the sixth turn.
+By default the agent captures four RGB-D views facing front, left, back, and
+right, separated by 90-degree left turns. The bridge and robot controller must
+return to the original heading after the fourth turn.
 
 ## Robot API
 

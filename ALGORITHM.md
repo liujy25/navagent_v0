@@ -16,7 +16,7 @@ categories.
 
 At every place step the agent:
 
-1. captures a six-view RGB-D panorama;
+1. captures a four-view RGB-D panorama facing front, left, back, and right;
 2. updates the local and cumulative BEV maps;
 3. creates or reuses the current place node and updates graph frontiers;
 4. summarizes the current node and stores landmark evidence;

@@ -27,8 +27,8 @@ class PanoramaConfig:
 
 def robot_panorama_config() -> PanoramaConfig:
     return PanoramaConfig(
-        observation_count=6,
+        observation_count=4,
         turns_per_observation=1,
         turn_direction="left",
-        turn_angle_degrees=60.0,
+        turn_angle_degrees=90.0,
     )

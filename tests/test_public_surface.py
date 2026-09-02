@@ -6,6 +6,7 @@ import navclaw.llm.client as client_module
 from navclaw.agent.actions import AgentActionType
 from navclaw.config.vln_runtime import VlnRuntimeConfig
 from navclaw.perception.goal import vln_instruction_goal_spec
+from navclaw.runtime.panorama_config import robot_panorama_config
 from navclaw.runners.robot_vln_runner import build_parser
 
 
@@ -46,6 +47,14 @@ def test_runtime_and_goal_are_fixed_to_canonical_vln() -> None:
         "vertical_transition",
         "finalize",
     }
+
+
+def test_robot_panorama_uses_front_left_back_right_views() -> None:
+    panorama = robot_panorama_config()
+    assert panorama.observation_count == 4
+    assert panorama.turns_per_observation == 1
+    assert panorama.turn_direction == "left"
+    assert panorama.observation_spacing_degrees == 90.0
 
 
 def test_one_model_is_used_for_every_completion(monkeypatch) -> None:

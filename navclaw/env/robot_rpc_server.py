@@ -42,7 +42,7 @@ from tf2_ros import Buffer
 from tf2_ros import TransformListener
 
 
-TURN_ANGLE_DEGREES = 60.0
+TURN_ANGLE_DEGREES = 90.0
 TF_LOOKUP_TIMEOUT_SEC = 1.0
 TF_READY_TIMEOUT_SEC = 20.0
 POLL_STEP_SEC = 0.1
