@@ -11,7 +11,16 @@ The Initial Task Progress Generator receives the original navigation instruction
 once and creates ordered route-level subtasks plus a final stopping requirement
 when one is stated. Every item starts as `active` with an empty result. Item
 content, order, and count are immutable after initialization; later partial facts
-are stored as dynamic progress conditions.
+are stored as dynamic progress conditions. Each item is one stage of the ordered
+route. Its action and spatial relations count as valid completion only when they
+are consistent with the surrounding route. The preceding and following items may
+constrain that judgment, but a following item need not itself be complete.
+
+A progress condition may store either a fact within its parent item or a route
+relation connecting the parent to an adjacent item. TPU creates such a transition
+condition only when the adjacent item is needed to disambiguate valid completion;
+the condition remains supporting state rather than a separate subtask or a fixed
+completion checklist.
 
 The Landmark Category Generator selects a minimal set of bounded physical object
 or fixture categories that can characterize scene content or place identity and
@@ -47,7 +56,14 @@ one or two ordered `tool_calls`: an optional non-empty
 `retrieve` or `update_progress` call. Item updates permit only `update` with
 `index`, `status`, `result`, and `reason`; conditions may be added, have their
 status updated, be rewritten, or be removed. A target being visible does not by
-itself prove that an instructed movement or spatial relation was completed.
+itself prove that an instructed movement or spatial relation was completed. TPU
+interprets each item in the ordered route context. It uses the preceding item to
+identify where the stage was executed and the following item when that item
+disambiguates the intended execution or transition. If the local action occurred
+but the route relation remains unresolved, TPU keeps the item active and may store
+that relation as a transition condition. Later evidence may confirm the condition
+or reopen a previously completed item whose execution conflicts with the ordered
+route.
 
 The memory index follows the current observation and retrieval workspace in the
 prompt. Each retrieval query asks one focused progress-verification question and

@@ -173,14 +173,43 @@ _VLN_NAVIGATION_TOOLS = {
 }
 
 
-def _vln_progress_update_rules(node_binding_rule: str) -> str:
-    return f"""
-Progress update rules:
+def _vln_progress_update_rules(
+    node_binding_rule: str,
+    *,
+    goal_kind: str,
+) -> str:
+    if str(goal_kind).strip() == GOAL_KIND_VLN_INSTRUCTION:
+        completion_rules = """
+- Assess task-progress items in instruction order and interpret each item in the context of the ordered route.
+- Evidence may complete several consecutive items only when it independently establishes each one.
+- Mark an item `done` only when its required action and spatial relations have been completed and the resulting state is consistent with any adjacent route stage that constrains its interpretation.
+- Use the preceding item to interpret the route context from which the current item is executed.
+- Use the following item when it disambiguates which execution or route transition of the current item is intended.
+- Do not require the following item itself to be completed before marking the current item `done`.
+- If the current item's local action has occurred but its consistency with the surrounding route remains unresolved, keep the item `active`.
+- Reopen a `done` item when later evidence shows that its previously accepted execution was inconsistent with the ordered route.
+""".strip()
+        condition_creation_rules = """
+- Add a transition condition only when an adjacent task-progress item provides information needed to disambiguate the valid completion of the parent item.
+- The condition should express the route relation that must be established, rather than restating either subtask.
+- Do not add a transition condition when the parent item's completion can already be determined from its own execution evidence.
+- Add any other condition only for a distinct partial-completion fact needed to assess its parent subtask.
+- Do not add unrelated scene notes, duplicates, or a restatement of the full subtask.
+""".strip()
+    else:
+        completion_rules = """
 - Assess task-progress items in instruction order. Evidence may complete several consecutive items only when it independently establishes each one.
-{node_binding_rule}
 - Mark a subtask `done` only when its required action and spatial relations have been completed. Keep it `active` when the target is only visible, only part of the relation is established, or decisive evidence is missing.
 - Reopen a `done` item only when current evidence directly invalidates the earlier completion judgment.
+""".strip()
+        condition_creation_rules = """
 - Add a condition only for a distinct partial-completion fact needed to assess its parent subtask. Do not add unrelated scene notes, duplicates, or a restatement of the full subtask.
+""".strip()
+    return f"""
+Progress update rules:
+{completion_rules}
+{node_binding_rule}
+{condition_creation_rules}
 - `update` changes only a condition state. `rewrite` refines or corrects the same underlying fact. `remove` deletes only a duplicate, irrelevant, or invalid condition; missing evidence does not justify removing an unconfirmed condition.
 - Determine item status from the full subtask semantics and execution evidence, not by counting confirmed conditions.
 - If the evidence supports no condition change, omit `update_progress_conditions`. If it supports no item change, use an empty `progress_updates` list.
@@ -636,7 +665,27 @@ Latest unresolved retrieval round:
         if require_retrieval_conclusion
         else ""
     )
-    task_progress_semantics = """
+    if str(goal_kind).strip() == GOAL_KIND_VLN_INSTRUCTION:
+        task_progress_semantics = """
+Task-progress semantics:
+- A task-progress item is one stage of the ordered navigation route or the final stopping requirement. Its content and order are fixed after initialization.
+- `done` means that the item's action and spatial relations have been completed consistently with the surrounding route context.
+- The preceding and following task-progress items may constrain how the current item should be interpreted and whether its execution constitutes valid completion.
+- Completion of a following item is not required to complete the current item; it is used only when it helps disambiguate the intended route transition.
+- A progress condition is an evidence-checkable fact used to assess the completion of its parent item.
+- A condition may describe progress within the parent item or a route relation connecting the parent item to an adjacent task-progress item.
+- A transition condition captures whether the state produced by the parent item is consistent with the route stage before or after it.
+- Conditions are supporting state, not separate subtasks.
+- TPU creates and revises conditions online to preserve partial progress and unresolved historical-verification needs.
+- `confirmed` means the available evidence establishes the exact condition.
+- `unconfirmed` means the condition is not yet established; it does not mean the condition is false.
+- The condition set is dynamic and is not a fixed completion checklist.
+- Determine the parent status from the full item semantics and execution evidence, not by counting confirmed conditions.
+- `result` is empty for an active item and a concise past-tense completion summary for a done item.
+- Start and completion node associations are system-owned and do not belong in item content, result, or condition content.
+""".strip()
+    else:
+        task_progress_semantics = """
 Task-progress semantics:
 - A task-progress item is one ordered route-level subtask or final stopping requirement. Its content and order are fixed after initialization.
 - A progress condition is one evidence-checkable partial-completion fact under its parent subtask; it is supporting state, not a separate subtask.
@@ -758,7 +807,10 @@ Return only valid JSON matching the response protocol.
             evidence_retrieval_policy
             if allow_retrieve or allow_update_progress
             else "",
-            _vln_progress_update_rules(node_binding_rule)
+            _vln_progress_update_rules(
+                node_binding_rule,
+                goal_kind=goal_kind,
+            )
             if allow_retrieve or allow_update_progress
             else "",
             conclusion_rules,

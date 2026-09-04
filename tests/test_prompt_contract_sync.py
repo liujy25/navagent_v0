@@ -19,6 +19,7 @@ from navclaw.agent.vertical_transition_policy import VerticalTransitionStepDecis
 from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext
 from navclaw.agent.visual_navigation import _vln_backtrack_context_text
 from navclaw.agent.visual_policy import (
+    decide_vln_task_progress_step,
     decide_vertical_transition_visual_action_point,
     ensure_task_progress_memory,
     normalize_vln_navigation_step,
@@ -36,7 +37,7 @@ from navclaw.agent.vln_waypoint_policy import (
 )
 from navclaw.agent.vln_waypoint_sampling import VlnSampledWaypointCandidate
 from navclaw.graph.graph import Graph
-from navclaw.memory.task_progress import TaskProgressMemory
+from navclaw.memory.task_progress import TaskProgressItem, TaskProgressMemory
 from navclaw.perception.landmark_detection import LANDMARK_DETECTOR_BOX_THRESHOLD
 
 
@@ -96,6 +97,89 @@ class PromptContractSyncTests(unittest.TestCase):
         )
         self.assertEqual(invalid["source"], "fallback")
         self.assertIn("must contain exactly", invalid["error"])
+
+    def test_tpu_prompt_uses_route_context_and_transition_conditions(self) -> None:
+        captured: dict[str, object] = {}
+
+        def decide(system_prompt, content):
+            captured["system_prompt"] = str(system_prompt)
+            captured["content"] = list(content)
+            return {
+                "tool_calls": [
+                    {
+                        "name": "update_progress",
+                        "arguments": {"progress_updates": []},
+                    }
+                ]
+            }
+
+        decide_vln_task_progress_step(
+            client=SimpleNamespace(decide_vln_task_progress_step=decide),
+            cache=SimpleNamespace(),
+            visual_context=VisualActionContext(current_node_id="n1", views=[]),
+            task_progress=TaskProgressMemory(
+                items=[
+                    TaskProgressItem(content="Complete the first route stage."),
+                    TaskProgressItem(content="Continue to the next route target."),
+                ]
+            ),
+            memory_index_text="",
+            retrieval_workspace_content=[],
+            retrieve_max_rounds=0,
+            retrieve_completed_rounds=0,
+            retrieve_fields_by_ref={},
+            allow_retrieve=False,
+            allow_update_progress=True,
+            require_retrieval_conclusion=False,
+        )
+
+        prompt_text = "\n".join(
+            str(item.get("text", ""))
+            for item in captured["content"]
+            if item.get("type") == "text"
+        )
+        self.assertIn("one stage of the ordered navigation route", prompt_text)
+        self.assertIn("consistently with the surrounding route context", prompt_text)
+        self.assertIn(
+            "route relation connecting the parent item to an adjacent task-progress item",
+            prompt_text,
+        )
+        self.assertIn("Use the preceding item to interpret", prompt_text)
+        self.assertIn("Use the following item when it disambiguates", prompt_text)
+        self.assertIn(
+            "Do not require the following item itself to be completed",
+            prompt_text,
+        )
+        self.assertIn("Add a transition condition only when", prompt_text)
+        self.assertIn(
+            "Do not add a transition condition when the parent item's completion",
+            prompt_text,
+        )
+
+    def test_transition_condition_stays_with_parent_item(self) -> None:
+        memory = TaskProgressMemory(
+            items=[
+                TaskProgressItem(content="Complete the first route stage."),
+                TaskProgressItem(content="Continue to the next route target."),
+            ]
+        )
+
+        memory.apply_condition_updates(
+            [
+                {
+                    "op": "add",
+                    "item_index": 0,
+                    "content": "The first route stage connects to the next route target.",
+                    "status": "unconfirmed",
+                }
+            ],
+            current_node_id="n1",
+        )
+
+        self.assertEqual(memory.items[0].status, "active")
+        self.assertEqual(memory.items[0].conditions[0].status, "unconfirmed")
+        self.assertEqual(memory.items[1].status, "active")
+        self.assertEqual(memory.items[1].conditions, [])
 
     def test_landmark_prompt_matches_bounded_place_identity_contract(self) -> None:
         captured: dict[str, object] = {}
