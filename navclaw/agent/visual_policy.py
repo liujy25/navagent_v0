@@ -699,6 +699,7 @@ Task-progress semantics:
     evidence_retrieval_policy = """
 Evidence and retrieval policy:
 - Judge each progress relation only from evidence that establishes it. Seeing a target does not prove that the required movement, passage, turn, entry, approach, or stop relation was executed.
+- Distinguish visibility from room membership. An object visible through a doorway or opening may belong to an adjacent room. Determine the agent's current room from spatial boundaries and entry/exit evidence, not from object visibility alone.
 - Use entity knowledge as a compact prior. Retrieve raw historical fields only when they can resolve a concrete subtask-status or condition judgment.
 - Do not retrieve for generic scene understanding, waypoint comparison, or unspecified additional context.
 - Each retrieval query asks one focused progress-verification question and requests only the entity fields needed to answer it.

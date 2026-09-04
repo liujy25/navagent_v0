@@ -155,6 +155,11 @@ class PromptContractSyncTests(unittest.TestCase):
             "Do not add a transition condition when the parent item's completion",
             prompt_text,
         )
+        self.assertIn("Distinguish visibility from room membership", prompt_text)
+        self.assertIn(
+            "spatial boundaries and entry/exit evidence",
+            prompt_text,
+        )
 
     def test_transition_condition_stays_with_parent_item(self) -> None:
         memory = TaskProgressMemory(

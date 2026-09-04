@@ -140,6 +140,13 @@ class MainlineDirectionAndModuleTests(unittest.TestCase):
             list(summary.to_dict()["direction_summaries"]),
             ["front", "back", "left", "right"],
         )
+        summary_prompt = str(client.content[0]["text"])
+        self.assertIn("Distinguish visibility from room membership", summary_prompt)
+        self.assertIn(
+            "determine the current room from spatial boundaries",
+            summary_prompt,
+        )
+        self.assertNotIn("entry/exit evidence", summary_prompt)
         retrieved = workspace.materialized_context_content()
         self.assertEqual(
             [

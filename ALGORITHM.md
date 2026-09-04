@@ -50,6 +50,11 @@ At every place step the agent:
 7. runs the Task Progress Updater (TPU) with bounded active retrieval, then runs
    the Progress-Conditioned Navigation Planner (PCNP).
 
+Current Node Summary assigns the current place type from visible spatial
+boundaries, not from objects seen through a doorway or opening. TPU combines
+those boundaries with executed entry/exit evidence when judging the robot's
+current room.
+
 TPU is the only module that retrieves raw historical fields. Its response has
 one or two ordered `tool_calls`: an optional non-empty
 `update_progress_conditions` call first, followed by exactly one final

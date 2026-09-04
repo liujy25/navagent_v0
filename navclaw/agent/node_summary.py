@@ -63,7 +63,8 @@ Field semantics:
 
 Evidence rules:
 - Base every claim only on the supplied panorama.
-- Use a specific place type such as bedroom or kitchen only when diagnostic visual evidence is clear; otherwise use a generic description such as room, corridor, doorway area, junction, entrance, or unclear indoor place.
+- Distinguish visibility from room membership. An object visible through a doorway or opening may belong to an adjacent room; determine the current room from spatial boundaries, not from object visibility alone.
+- Use a specific place type such as bedroom or kitchen only when diagnostic visual evidence and spatial boundaries establish it as the current place; otherwise use a generic description such as room, corridor, doorway area, junction, entrance, or unclear indoor place.
 - Do not infer the identity or contents of an unseen area behind a doorway or around a corner.
 - Mention an object or landmark only when its appearance is visually clear.
 - Describe a clearly open passage or visible walking surface without claiming guaranteed reachability from appearance alone.
