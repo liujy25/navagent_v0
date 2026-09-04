@@ -169,15 +169,19 @@ class MainlineDirectionAndModuleTests(unittest.TestCase):
             def decide_vln_task_progress_step(self, system_prompt, content):
                 self.calls.append(("progress", system_prompt, list(content)))
                 return {
-                    "progress_condition_updates": [],
-                    "update_progress": {"progress_updates": []},
+                    "tool_calls": [
+                        {
+                            "name": "update_progress",
+                            "arguments": {"progress_updates": []},
+                        }
+                    ]
                 }
 
             def decide_vln_navigation_step(self, system_prompt, content):
                 self.calls.append(("navigation", system_prompt, list(content)))
                 return {
                     "go_to_waypoint": {
-                        "objective": "Enter the corridor.",
+                        "direction": "front",
                         "reason": "It advances the current progress item.",
                     }
                 }
@@ -223,8 +227,9 @@ class MainlineDirectionAndModuleTests(unittest.TestCase):
             "Progress-Conditioned Navigation Planner",
             navigation_call[1],
         )
-        self.assertNotIn("RETRIEVE:", navigation_text)
-        self.assertNotIn("UPDATE_PROGRESS:", navigation_text)
+        self.assertNotIn("### `retrieve`", navigation_text)
+        self.assertNotIn("### `update_progress`", navigation_text)
+        self.assertIn("### `update_progress`", progress_text)
         self.assertNotIn("Navigation task:", progress_text)
         self.assertNotIn("Navigation task:", navigation_text)
 
@@ -392,6 +397,7 @@ class MainlineDirectionAndModuleTests(unittest.TestCase):
             progress_analysis="",
             progress_reasoning="",
             reasoning_action="Enter the corridor.",
+            direction="front",
         )
         content = _vln_waypoint_inherited_agent_context(
             context_loop=None,
@@ -402,7 +408,15 @@ class MainlineDirectionAndModuleTests(unittest.TestCase):
         )
         prompt_text = "\n".join(str(item.get("text", "")) for item in content)
         self.assertNotIn("Navigation task:", prompt_text)
-        self.assertIn("Active item: Leave the room.", prompt_text)
+        self.assertIn(
+            "Active item and its read-only grounding conditions:\nLeave the room.",
+            prompt_text,
+        )
+        self.assertIn('"direction": "front"', prompt_text)
+        self.assertLess(
+            prompt_text.index("High-level navigation action:"),
+            prompt_text.index("Navigation state:"),
+        )
 
         for payload in (
             {

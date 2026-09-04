@@ -517,14 +517,14 @@ def _vln_backtrack_context_text(
     for index, item in enumerate(backtrack_contexts):
         lines.extend(
             [
-                f"backtrack {int(index)}:",
-                "- trigger planning node: "
+                f"Backtrack {int(index) + 1}:",
+                "- Trigger planning reference node: "
                 + str(item.get("trigger_planning_node_id", "")),
-                "- current planning node: " + str(item.get("anchor_node_id", "")),
-                "- physical robot node: "
+                "- Planning reference node: " + str(item.get("anchor_node_id", "")),
+                "- Physical robot node: "
                 + str(item.get("physical_robot_node_id", "")),
-                "- objective: " + str(item.get("objective", "")),
-                "- reason: " + str(item.get("reason", "")),
+                "- Objective: " + str(item.get("objective", "")),
+                "- Reason: " + str(item.get("reason", "")),
             ]
         )
         result = item.get("result")
@@ -538,13 +538,6 @@ def _vln_backtrack_context_text(
                 ]
             )
     return "\n".join(lines)
-
-
-def _vln_backtrack_context_content(
-    backtrack_contexts: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    text = _vln_backtrack_context_text(backtrack_contexts)
-    return [] if text == "" else [{"type": "text", "text": text}]
 
 
 def _vln_waypoint_inherited_agent_context(
@@ -564,6 +557,9 @@ def _vln_waypoint_inherited_agent_context(
         navigation_action["movement"] = str(
             navigation_mode.approach_movement or "move"
         )
+    direction = str(navigation_mode.direction).strip()
+    if direction != "":
+        navigation_action["direction"] = direction
     objective = str(navigation_mode.action_objective).strip()
     if objective != "":
         navigation_action["objective"] = objective
@@ -587,7 +583,9 @@ def _vln_waypoint_inherited_agent_context(
         else ""
     )
     active_item_section = (
-        f"Active item: {active_item}\n"
+        "Active item and its read-only grounding conditions:\n"
+        f"{active_item}\n"
+        "An unconfirmed condition remains unresolved and is not an established fact.\n"
         if active_item != ""
         else ""
     )
@@ -619,14 +617,14 @@ def _vln_waypoint_inherited_agent_context(
         {
             "type": "text",
             "text": (
-                "Navigation step context:\n"
+                "High-level navigation action:\n"
+                f"{json.dumps(navigation_action, ensure_ascii=False)}\n\n"
+                "Navigation state:\n"
                 f"{progress_memory_section}"
                 f"{active_item_section}"
                 f"{retrieval_section}"
                 f"{backtrack_section}"
                 f"{progress_updates_section}"
-                "Navigation action:\n"
-                f"{json.dumps(navigation_action, ensure_ascii=False)}"
             ),
         }
     ]
@@ -953,10 +951,7 @@ def run_episodic_retrieval_loop(
             if not progress_is_current
             else workspace.conclusion_context_content()
         ) if workspace.rounds != [] else []
-        retrieval_context_content = [
-            *retrieval_context_content,
-            *_vln_backtrack_context_content(backtrack_contexts),
-        ]
+        backtrack_context_text = _vln_backtrack_context_text(backtrack_contexts)
         progress_context_text = "\n\n".join(
             item
             for item in (
@@ -974,7 +969,7 @@ def run_episodic_retrieval_loop(
         if progress_is_current:
             if task_progress_decision is None:
                 raise ValueError(
-                    "Navigation Planner requires the latest task-progress update"
+                    "PCNP requires the latest task-progress update"
                 )
             decision = decide_vln_navigation_step(
                 client=state.llm_client,
@@ -985,6 +980,7 @@ def run_episodic_retrieval_loop(
                 latest_task_progress=task_progress_decision,
                 retrieval_workspace_content=retrieval_context_content,
                 progress_context_text=progress_context_text,
+                backtrack_context_text=backtrack_context_text,
                 landmark_panorama_views=landmark_panorama_views,
                 detected_landmarks_text=detected_landmarks_text,
                 allowed_backtrack_node_ids=allowed_backtrack_node_ids,
@@ -1024,6 +1020,7 @@ def run_episodic_retrieval_loop(
                 allow_update_progress=True,
                 require_retrieval_conclusion=workspace.has_pending_evidence,
                 progress_context_text=progress_context_text,
+                backtrack_context_text=backtrack_context_text,
                 landmark_panorama_views=landmark_panorama_views,
                 detected_landmarks_text=detected_landmarks_text,
                 terminal_check_context=(
@@ -1093,7 +1090,7 @@ def run_episodic_retrieval_loop(
             if terminal_check_required:
                 terminal_check_payload = {
                     "decision": str(decision.terminal_check_decision),
-                    "reasoning": str(decision.terminal_check_reasoning),
+                    "reason": str(decision.terminal_check_reasoning),
                     "missing_constraints": [
                         str(item)
                         for item in decision.terminal_check_missing_constraints
@@ -1253,7 +1250,7 @@ def plan_visual_navigation_action(
     if initial_navigation_mode is None:
         terminal_check = {
             "decision": str(task_progress_decision.terminal_check_decision),
-            "reasoning": str(task_progress_decision.terminal_check_reasoning),
+            "reason": str(task_progress_decision.terminal_check_reasoning),
             "missing_constraints": [
                 str(item)
                 for item in task_progress_decision.terminal_check_missing_constraints
@@ -1325,16 +1322,14 @@ def plan_visual_navigation_action(
                     visual_context=planning_visual_context,
                     task_progress=task_progress_memory,
                     retrieval_workspace_content=(
-                        [
-                            *(
-                                workspace.conclusion_context_content()
-                                if workspace.rounds != []
-                                else []
-                            ),
-                            *_vln_backtrack_context_content(backtrack_contexts),
-                        ]
+                        workspace.conclusion_context_content()
+                        if workspace.rounds != []
+                        else []
                     ),
                     latest_task_progress=task_progress_decision,
+                    backtrack_context_text=_vln_backtrack_context_text(
+                        backtrack_contexts
+                    ),
                     navigation_replan_feedback_text=_navigation_replan_feedback_text(
                         navigation_replan_feedback
                     ),

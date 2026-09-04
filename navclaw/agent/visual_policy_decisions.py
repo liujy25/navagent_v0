@@ -23,12 +23,31 @@ class TaskProgressDecision:
     terminal_check_missing_constraints: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "progress_updates": [dict(item) for item in self.progress_updates],
-            "progress_condition_updates": [
-                dict(item) for item in self.progress_condition_updates
-            ],
+        tool_calls: list[dict[str, object]] = []
+        if self.progress_condition_updates:
+            tool_calls.append(
+                {
+                    "name": "update_progress_conditions",
+                    "arguments": {
+                        "condition_updates": [
+                            dict(item) for item in self.progress_condition_updates
+                        ]
+                    },
+                }
+            )
+        progress_arguments: dict[str, object] = {
+            "progress_updates": [dict(item) for item in self.progress_updates]
         }
+        if self.terminal_check_decision.strip():
+            progress_arguments["terminal_check"] = {
+                "decision": self.terminal_check_decision,
+                "reason": self.terminal_check_reasoning,
+                "missing_constraints": list(self.terminal_check_missing_constraints),
+            }
+        tool_calls.append(
+            {"name": "update_progress", "arguments": progress_arguments}
+        )
+        payload: dict[str, object] = {"tool_calls": tool_calls}
         if self.progress_analysis.strip():
             payload["progress_analysis"] = self.progress_analysis
         if self.progress_reasoning.strip():
@@ -44,13 +63,7 @@ class TaskProgressDecision:
                 }
             )
         if self.retrieval_conclusion.strip():
-            payload["retrieval_conclusion"] = self.retrieval_conclusion
-        if self.terminal_check_decision.strip():
-            payload["terminal_check"] = {
-                "decision": self.terminal_check_decision,
-                "reasoning": self.terminal_check_reasoning,
-                "missing_constraints": list(self.terminal_check_missing_constraints),
-            }
+            payload = {"retrieval_conclusion": self.retrieval_conclusion, **payload}
         return payload
 
 
@@ -62,6 +75,7 @@ class NavigationModeDecision:
     progress_reasoning: str
     reasoning_action: str
     approach_movement: str = ""
+    direction: str = ""
     progress_updates: list[dict[str, object]] = field(default_factory=list)
     vertical_direction: str = ""
     route_status: str = "continue_current"
@@ -79,6 +93,7 @@ class NavigationModeDecision:
             "action_mode": self.action_mode,
             "stop_objective": self.stop_objective,
             "reasoning_action": self.reasoning_action,
+            "direction": self.direction,
             "vertical_direction": self.vertical_direction,
         }
         if self.progress_updates:
@@ -138,9 +153,10 @@ class VisualActionPointDecision:
     target: str
     reasoning: str
     failure_reason: str = ""
+    status: str = ""
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "point_2d": (
                 None
                 if self.point_2d is None
@@ -150,6 +166,9 @@ class VisualActionPointDecision:
             "reasoning": self.reasoning,
             "failure_reason": self.failure_reason,
         }
+        if self.status.strip():
+            payload = {"status": self.status, **payload}
+        return payload
 
 
 @dataclass(frozen=True)
@@ -200,6 +219,75 @@ def normalize_visual_action_point(
         point_2d=point_2d,
         target=str(payload.get("target", "")).strip(),
         reasoning=str(payload.get("reasoning", "")).strip(),
+        failure_reason=failure_reason,
+    )
+
+
+def normalize_vertical_transition_visual_action_point(
+    payload: dict[str, object],
+) -> VisualActionPointDecision:
+    expected_fields = {
+        "status",
+        "reasoning",
+        "point_2d",
+        "target",
+        "failure_reason",
+    }
+    if set(payload) != expected_fields:
+        raise ValueError(
+            "vertical transition visual action fields must be exactly "
+            f"{sorted(expected_fields)!r}: {payload!r}"
+        )
+    status = str(payload.get("status", "")).strip().lower()
+    reasoning = str(payload.get("reasoning", "")).strip()
+    target = str(payload.get("target", "")).strip()
+    failure_reason = str(payload.get("failure_reason", "")).strip()
+    point = payload.get("point_2d")
+    if status not in {"success", "failure"}:
+        raise ValueError(
+            "vertical transition visual action status must be success or failure: "
+            f"{payload!r}"
+        )
+    if reasoning == "":
+        raise ValueError(
+            f"vertical transition visual action requires reasoning: {payload!r}"
+        )
+    point_2d: tuple[float, float] | None = None
+    if status == "success":
+        if not isinstance(point, list) or len(point) != 2:
+            raise ValueError(
+                "successful vertical transition visual action requires a "
+                f"length-2 point_2d list: {payload!r}"
+            )
+        if any(
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            for value in point
+        ):
+            raise ValueError(
+                "vertical transition visual action point_2d values must be "
+                f"numbers: {payload!r}"
+            )
+        x, y = float(point[0]), float(point[1])
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise ValueError(
+                f"vertical transition visual action point_2d outside [0,1]: {payload!r}"
+            )
+        if target == "" or failure_reason != "":
+            raise ValueError(
+                "successful vertical transition visual action requires a target "
+                f"and empty failure_reason: {payload!r}"
+            )
+        point_2d = (x, y)
+    elif point is not None or target != "" or failure_reason == "":
+        raise ValueError(
+            "failed vertical transition visual action requires point_2d=null, "
+            f"an empty target, and a non-empty failure_reason: {payload!r}"
+        )
+    return VisualActionPointDecision(
+        status=status,
+        point_2d=point_2d,
+        target=target,
+        reasoning=reasoning,
         failure_reason=failure_reason,
     )
 

@@ -9,10 +9,7 @@ from navclaw.agent.visual_navigation import (
     ensure_current_node_summary_for_visual_policy,
 )
 from navclaw.agent.visual_policy import ensure_task_progress_memory
-from navclaw.agent.visual_step_execution import (
-    run_pending_stop_confirmation,
-    run_visual_waypoint_decision,
-)
+from navclaw.agent.visual_step_execution import run_visual_waypoint_decision
 from navclaw.agent.vln_runtime import begin_vln_step, refresh_vln_state, robot_action_count
 from navclaw.config.vln_runtime import VlnRuntimeConfig
 from navclaw.env.interface import EnvInterface
@@ -67,19 +64,43 @@ def _landmark_categories(client: LLMClient, instruction: str) -> list[str]:
     response = client._create_visual_json_completion(
         call_name="vln_landmark_detection_list",
         system_prompt=(
-            "Choose visual landmark categories for a VLN navigation instruction. "
-            "Return JSON only."
+            "You are the VLN Landmark Category Generator in NavClaw.\n"
+            "Select a minimal set of instruction-relevant category names for bounded "
+            "physical objects or fixtures that characterize scene content or place "
+            "identity and that the existing visual detector can localize with stable "
+            "bounding boxes.\n"
+            "Use mentioned place types to infer only their most diagnostic typical "
+            "detectable objects when they help recognize an instructed location.\n"
+            "Treat passage and circulation structures exclusively as visual route "
+            "evidence that downstream modules interpret directly from images.\n"
+            "Return only valid JSON matching the provided output contract."
         ),
         user_prompt=f"""
-Instruction:
+Navigation instruction:
 {instruction}
 
-Return concrete visible object or fixture categories useful for following the
-instruction. Categories must have stable image bounding boxes. Do not include
-rooms, floors, stairs, passages, openings, routes, or directions.
+Decision objective:
+Select a minimal set of detector-groundable object or fixture categories that can serve as visual landmark entities for this episode.
 
-Return JSON only:
-{{"landmark_categories": ["chair", "table"]}}
+Landmark-category semantics:
+- A landmark category is a bounded physical object or fixture class that characterizes scene content or place identity and that the existing detector can localize with a stable bounding box.
+- Eligible categories may be stated explicitly or inferred conservatively from a place type named in the instruction.
+- This detector-facing list is not a complete inventory of semantic references in the instruction.
+- Place types identify where to navigate; passage and circulation structures belong exclusively to visual route evidence interpreted directly from the panorama and other observation or memory representations.
+
+Selection rules:
+- Output short object or category nouns only.
+- Start with explicitly named eligible objects and fixtures that help follow the instruction.
+- For each distinct place type in the instruction, add at most one inferred category only when it is strongly typical, visually distinctive, detector-groundable, and useful for recognizing that place.
+- Keep the inferred set minimal and use the same category once when a place type is repeated.
+- Build the list from bounded object or fixture identities that characterize scene content or place identity; route, access, motion, relation, direction, and region semantics stay in the visual navigation context.
+- Avoid duplicates and near-synonymous variants of the same detector category.
+- Return an empty list when the instruction contains no suitable category.
+
+Output contract:
+{{
+  "landmark_categories": ["<category>"]
+}}
 """.strip(),
         max_new_tokens=1024,
         token_field="max_completion_tokens",
@@ -267,13 +288,12 @@ def run_vln_episode(
             )
             refresh_vln_state(context=context, state=state, step=step)
             ensure_current_node_summary_for_visual_policy(state=state, step=step)
-            if not run_pending_stop_confirmation(context=context, state=state, step=step):
-                run_visual_waypoint_decision(
-                    context=context,
-                    state=state,
-                    step=step,
-                    context_evidence_text="",
-                )
+            run_visual_waypoint_decision(
+                context=context,
+                state=state,
+                step=step,
+                context_evidence_text="",
+            )
             completed_steps += 1
             action_trace.append(
                 {

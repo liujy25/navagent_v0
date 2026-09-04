@@ -6,10 +6,16 @@ language navigation (VLN) agent. It contains one algorithm configuration:
 - independent task-progress updating and progress-conditioned navigation;
 - active episodic retrieval with up to eight rounds per place step;
 - entity knowledge consolidation after retrieval;
-- graph-aware backtracking and stop confirmation;
+- virtual planning-reference backtracking and TPU-owned terminal checks;
 - Frontier Skeleton Sampling (FSS) waypoint grounding from RGB-D;
 - multi-floor vertical-transition handling;
 - YOLO-World landmark detection.
+
+The prompt/runtime contracts match the current NavClaw mainline: strict initial
+progress items, TPU ordered `tool_calls`, direction-bearing PCNP actions, fixed
+action grounding by the Waypoint Planner, round-aligned EKM traces, and explicit
+vertical-grounding success/failure responses. The raw instruction is used only
+for initialization; later planning uses maintained progress state.
 
 It intentionally excludes Habitat/HM3D/R2R evaluation runners, experiment
 ablations, replay tools, batch launchers, web viewers, and raw prompt/response

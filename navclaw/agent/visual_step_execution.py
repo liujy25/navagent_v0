@@ -8,7 +8,6 @@ from navclaw.agent.actions import AgentAction, AgentActionType
 from navclaw.agent.decisions import act_decision
 from navclaw.agent.feedback import apply_agent_feedback
 from navclaw.agent.node_moves import set_pending_node_move
-from navclaw.agent.visual_navigation import confirm_pending_visual_stop
 from navclaw.agent.visual_navigation import plan_visual_navigation_action
 from navclaw.agent.visual_policy_decisions import NAVIGATION_STOP_APPROACH_ACTION_MODES
 from navclaw.agent.vertical_transition import execute_vertical_transition_action
@@ -17,48 +16,6 @@ from navclaw.types import LocalmapPlaceReuseState
 
 if TYPE_CHECKING:
     from navclaw.agent.state import NavClawAgentContext, NavClawAgentState
-
-
-def run_pending_stop_confirmation(
-    *,
-    context: "NavClawAgentContext",
-    state: "NavClawAgentState",
-    step,
-) -> bool:
-    pending_stop = state.pending_stop_confirmation
-    if not isinstance(pending_stop, dict):
-        return False
-    payload = confirm_pending_visual_stop(
-        state=state,
-        step=step,
-        goal=context.goal_spec,
-        pending_stop=pending_stop,
-    )
-    decision = payload.get("decision")
-    if not isinstance(decision, dict):
-        raise ValueError(f"stop confirmation payload missing decision: {payload!r}")
-    decision_name = str(decision.get("decision", "")).strip()
-    if decision_name != "stop":
-        step.policy_decision = {
-            "source": "visual_stop_confirmation_continue",
-            "decision": deepcopy(payload),
-        }
-        state.pending_stop_confirmation = None
-        return False
-
-    _execute_terminal_stop(
-        state=state,
-        step=step,
-        pending_stop=pending_stop,
-        policy_decision={
-            "source": "visual_stop_confirmation",
-            "decision": deepcopy(payload),
-        },
-        reason=str(decision.get("reasoning", "")),
-        executed_action_type="visual_stop_confirmed",
-        extra_executed_fields={"confirmation": deepcopy(payload)},
-    )
-    return True
 
 
 def _execute_terminal_stop(
@@ -172,7 +129,7 @@ def run_visual_waypoint_decision(
                 "source": "vln_progress_terminal_check",
                 "terminal_check": deepcopy(decision.terminal_check),
             },
-            reason=str(decision.terminal_check.get("reasoning", "")),
+            reason=str(decision.terminal_check.get("reason", "")),
             executed_action_type="vln_progress_terminal_done",
             extra_executed_fields={
                 "terminal_check": deepcopy(decision.terminal_check)
@@ -401,6 +358,7 @@ def _execute_visual_action_call(
         stop_approach = bool(action.args.get("stop_approach", False))
         state.previous_place_node_id = str(step.current_place_node_id)
         decision_type = str(action.args.get("decision_type", "")).strip()
+        move_mode = decision_type if decision_type != "" else "visual_waypoint"
         navigation_mode = decision_payload.get("navigation_mode")
         navigation_action_mode = (
             str(navigation_mode.get("action_mode", "")).strip()
@@ -417,9 +375,9 @@ def _execute_visual_action_call(
                 backtrack_reference_node_id = str(
                     latest_backtrack.get("anchor_node_id", "")
                 ).strip()
-            decision_type = "backtrack"
+            move_mode = "backtrack"
         elif navigation_action_mode == "backtrack":
-            decision_type = "backtrack"
+            move_mode = "backtrack"
             backtrack_reference_node_id = str(
                 navigation_mode.get("backtrack_anchor_node_id", "")
             ).strip()
@@ -428,9 +386,7 @@ def _execute_visual_action_call(
             step_id=int(step.place_step_index),
             from_node_id=str(step.current_place_node_id),
             reason=str(action.reason),
-            move_mode=(
-                decision_type if decision_type != "" else "visual_waypoint"
-            ),
+            move_mode=move_mode,
             backtrack_reference_node_id=backtrack_reference_node_id,
             backtrack_contexts=[
                 deepcopy(item)
@@ -506,6 +462,7 @@ def _execute_visual_action_call(
             if decision_type == "approach_to_stop":
                 pending_stop["movement"] = "move"
                 state.pending_vln_terminal_check = pending_stop
+                state.pending_stop_confirmation = None
             else:
                 state.pending_stop_confirmation = pending_stop
         return

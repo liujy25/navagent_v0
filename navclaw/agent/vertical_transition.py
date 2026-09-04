@@ -13,7 +13,7 @@ from navclaw.agent.visual_action_context import (
 )
 from navclaw.agent.visual_grounding import VisualWaypoint, ground_visual_waypoint
 from navclaw.agent.visual_policy import (
-    decide_visual_action_point,
+    decide_vertical_transition_visual_action_point,
     verify_vertical_transition_waypoint,
 )
 from navclaw.agent.visual_policy_decisions import (
@@ -634,24 +634,36 @@ def _plan_vertical_transition_waypoint(
     rejected_point_2d: tuple[float, float] | None = None
     attempts: list[dict[str, object]] = []
     for attempt_index in range(VERTICAL_WAYPOINT_VERIFICATION_MAX_ATTEMPTS):
-        visual_action = decide_visual_action_point(
+        visual_action = decide_vertical_transition_visual_action_point(
             client=state.llm_client,
             cache=state.cache,
-            goal_text=goal_text,
             selected_view=selected_view,
             waypoint_target=str(step_decision.waypoint_target),
             revision_feedback=revision_feedback,
             rejected_point_2d=rejected_point_2d,
-            include_graph_context=visual_context.graph_context_visible,
         )
         attempt_payload: dict[str, object] = {
             "attempt_index": int(attempt_index),
             "visual_action": visual_action.to_dict(),
         }
-        if visual_action.failure_reason != "":
+        if visual_action.status == "failure" or visual_action.failure_reason != "":
             attempt_payload["failure_reason"] = str(visual_action.failure_reason)
             attempts.append(attempt_payload)
-            raise ValueError(str(visual_action.failure_reason))
+            raise VerticalTransitionStepReplan(
+                "vertical_visual_action_grounding_failure",
+                feedback={
+                    "type": "visual_action_grounding_failure",
+                    "requested_direction": str(direction),
+                    "rejected_options": [
+                        {
+                            "angle_deg": int(selected_view.angle_deg),
+                            "waypoint_target": str(step_decision.waypoint_target),
+                        }
+                    ],
+                    "feedback": str(visual_action.failure_reason),
+                    "visual_action": visual_action.to_dict(),
+                },
+            )
         if visual_action.point_2d is None:
             attempt_payload["failure_reason"] = "visual_action_missing_point_2d"
             attempts.append(attempt_payload)

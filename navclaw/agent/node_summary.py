@@ -48,27 +48,33 @@ def summarize_current_node(
         [int(view.angle_deg) for view in visual_context.views]
     )
     system_prompt = """
-You are a node summary worker for an embodied navigation agent.
-Your job is to summarize the current place node from visual observations.
+You are the Current Node Summary module in NavClaw.
+Summarize the place represented by the supplied panorama and the distinctive content visible in each local view.
+Do not infer task progress, historical events, or a navigation action.
+Return only valid JSON matching the provided output contract.
 """.strip()
     text = f"""
-Write a compact semantic summary of the current node itself.
+Decision objective:
+Create compact textual entity knowledge for the current place node from the supplied panorama.
 
-Rules:
-- Describe the visually supported place type, such as a room, corridor, doorway, junction, entrance, or unclear indoor place.
-- Use a more specific room identity, such as bedroom or kitchen, only when diagnostic visual evidence is clear.
-- In direction_summaries, describe visible semantic areas, rooms, objects, or landmarks for each panorama direction.
-- Mention an object only when its visual appearance is clear; use a generic structural description when the content is ambiguous.
-- Base every scene and object claim only on the attached panorama views.
-- Claim a direction is navigable only when it is visually obvious; otherwise describe visibility rather than policy.
-- Exclude raw detection ids, observation ids, bounding boxes, coordinates, and system internals.
-- Keep both fields short and concrete.
-- direction_summaries must contain exactly these keys: {_direction_summary_keys_text(allowed_angles)}.
-- Use an empty string for a direction when there is no distinctive navigation-relevant cue or it merely repeats the overall node summary.
+Field semantics:
+- `node_summary` describes the place as a whole across all supplied views.
+- `direction_summaries` describes distinctive visible content in each local panorama direction; these descriptions are observations, not route recommendations.
 
-Return JSON only:
+Evidence rules:
+- Base every claim only on the supplied panorama.
+- Use a specific place type such as bedroom or kitchen only when diagnostic visual evidence is clear; otherwise use a generic description such as room, corridor, doorway area, junction, entrance, or unclear indoor place.
+- Do not infer the identity or contents of an unseen area behind a doorway or around a corner.
+- Mention an object or landmark only when its appearance is visually clear.
+- Describe a clearly open passage or visible walking surface without claiming guaranteed reachability from appearance alone.
+- Exclude detection ids, observation ids, bounding boxes, coordinates, candidate labels, overlay labels, and other system internals.
+- Keep `node_summary` to one concise sentence.
+- `direction_summaries` must contain exactly these keys: {_direction_summary_keys_text(allowed_angles)}.
+- Use an empty string when a direction has no distinctive navigation-relevant cue or only repeats the place-level summary.
+
+Output contract:
 {{
-  "node_summary": "<one concise sentence describing this node/place itself>",
+  "node_summary": "<one concise place-level sentence>",
   "direction_summaries": {_direction_summary_schema_text(allowed_angles)}
 }}
 """.strip()

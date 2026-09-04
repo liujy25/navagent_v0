@@ -48,36 +48,49 @@ def decide_vertical_transition_step(
 ) -> VerticalTransitionStepDecision:
     allowed_angles = visual_context.available_angles
     system_prompt = """
-You are guiding an embodied navigation agent up or down a staircase.
-Decide whether the agent has reached the next floor. If not, choose the next visible and reachable place to continue.
-Return JSON only.
+You are the Vertical Transition Step Planner in NavClaw.
+For the fixed up- or down-stair action, decide whether the transition is complete; otherwise identify one visible reachable local region for the next movement.
+Do not change the requested vertical direction or choose an image point.
+Return only valid JSON matching the provided output contract.
 """.strip()
     request_text = f"""
-Requested movement:
+Fixed vertical-transition action:
 {instruction}
 """.strip()
     decision_text = f"""
-Decision rules:
-- Interpret upstairs and downstairs from the agent's current pose.
-- `complete`: the agent has reached the first stable corridor or room floor beyond the staircase just traversed.
-- A stair-turn landing or mid-stair platform that only connects parts of the same staircase is not complete, but may be selected as the next waypoint when needed to continue.
-- Once a corridor or room floor is reached, another visible staircase belongs to a later navigation action.
-- `continue`: another local move is needed to enter the staircase, continue along it, or reach the next-floor walking surface.
-- For `continue`, choose the next waypoint using this priority:
-  1. If the next-floor walking surface is visible and reachable, choose the nearest reachable point on the first stable floor immediately beyond the final stair tread, before any onward corridor or room travel.
-  2. Otherwise, choose the farthest clearly reachable area that continues along the staircase in the requested direction.
-  3. If the staircase has not yet been entered, choose a reachable area that approaches or enters its visible entrance.
-- Identify the view containing the selected area and describe one matching reachable waypoint target. Select its direction from {allowed_directions_text(allowed_angles)}.
-- `fail`: no reachable local movement in the current panorama can enter or continue in the requested direction.
-- Briefly state the status judgment in thought. For `continue`, also state why the selected view and target best follow the waypoint priority.
-- For `complete` or `fail`, use an empty waypoint_target and a null selected_direction.
+Decision semantics:
+- `complete`: the agent has reached a stable walking surface on the destination floor beyond the staircase being traversed.
+- `continue`: one more local move is required to enter the staircase, continue on it, or reach the destination-floor walking surface.
+- `fail`: the current panorama provides no reachable local movement that can enter or continue the requested transition.
+- A turn landing or mid-stair platform that only connects parts of the same staircase is not completion.
+- A different staircase visible after reaching the destination-floor corridor or room belongs to a later high-level action.
+
+Evidence rules:
+- Judge completion from the current fresh panorama and supplied movement history, not from a proposed point.
+- Interpret `up` and `down` as elevation change from the agent's current physical pose.
+- Treat rejected movement options as invalid for the current panorama unless new evidence changes their validity.
+
+Waypoint-target priority for `continue`:
+1. If the destination-floor walking surface is visible and reachable, choose the nearest safe region immediately beyond the final stair tread.
+2. Otherwise choose the farthest clearly reachable region that continues along the current staircase in the requested vertical direction.
+3. If the staircase has not been entered, choose a reachable region at or just inside its visible entrance.
+
+Output rules:
+- For `continue`, describe one concrete reachable region in `waypoint_target` and select its view from {allowed_directions_text(allowed_angles)}.
+- For `complete` or `fail`, use an empty `waypoint_target` and JSON `null` for `selected_direction`.
+- `thought` is a concise status basis and, for `continue`, states why the target follows the priority above; it is not a long reasoning trace.
 """.strip()
     output_text = """
-Return JSON only with exactly these fields in this order:
-- thought: string
-- transition_status: one of "complete", "continue", or "fail"
-- waypoint_target: string
-- selected_direction: one of "front", "back", "left", or "right"; null for complete or fail
+Output contract:
+{
+  "thought": "<concise status and target basis>",
+  "transition_status": "complete|continue|fail",
+  "waypoint_target": "<reachable local region, or empty string>",
+  "selected_direction": "front|back|left|right|null"
+}
+
+For `complete` or `fail`, `selected_direction` is null:
+{"thought":"<concise status basis>","transition_status":"complete","waypoint_target":"","selected_direction":null}
 """.strip()
     content = [
         {"type": "text", "text": request_text},
@@ -103,16 +116,16 @@ Return JSON only with exactly these fields in this order:
             views=visual_context.views,
         )
     )
-    if isinstance(current_retry_feedback, dict) and current_retry_feedback != {}:
-        feedback_text = _vertical_transition_retry_feedback_text(current_retry_feedback)
-        if feedback_text != "":
-            content.append({"type": "text", "text": feedback_text})
     content.extend(
         [
             {"type": "text", "text": decision_text},
             {"type": "text", "text": output_text},
         ]
     )
+    if isinstance(current_retry_feedback, dict) and current_retry_feedback != {}:
+        feedback_text = _vertical_transition_retry_feedback_text(current_retry_feedback)
+        if feedback_text != "":
+            content.append({"type": "text", "text": feedback_text})
     parsed = client.decide_vertical_transition_step(system_prompt, content)
     return _normalize_vertical_transition_step(
         parsed,
@@ -140,7 +153,19 @@ def _normalize_vertical_transition_step(
         )
     selected_angle: int | None = None
     if transition_status in {"complete", "fail"}:
-        waypoint_target = ""
+        if waypoint_target != "":
+            raise ValueError(
+                "complete or failed vertical transition step requires an empty "
+                f"waypoint_target: {payload!r}"
+            )
+        if (
+            payload.get("selected_direction") is not None
+            or payload.get("selected_angle_deg") is not None
+        ):
+            raise ValueError(
+                "complete or failed vertical transition step requires a null "
+                f"selected_direction: {payload!r}"
+            )
     else:
         raw_direction = payload.get("selected_direction")
         raw_angle = payload.get("selected_angle_deg")
@@ -201,8 +226,8 @@ def _append_vertical_transition_rgb_history(
             "type": "text",
             "text": (
                 "Movement history:\n"
-                "- Movements are shown in execution order.\n"
-                "- Within each movement, frames are ordered by time."
+                "- Movement blocks are shown in execution order.\n"
+                "- Frames are ordered chronologically from left to right and then top to bottom."
             ),
         }
     )
@@ -242,4 +267,7 @@ def _vertical_transition_retry_feedback_text(feedback: dict[str, object]) -> str
                 + str(option["waypoint_target"]).strip(),
             ]
         )
+    failure_detail = str(feedback.get("feedback", "")).strip()
+    if failure_detail != "":
+        lines.extend(["", "Grounding failure:", failure_detail])
     return "\n".join(lines)

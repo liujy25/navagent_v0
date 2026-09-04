@@ -43,17 +43,15 @@ You select one labeled local waypoint candidate by following the updated task pr
 Use the current active progress item as the immediate waypoint objective.
 """.strip()
 
-VLN_WAYPOINT_INHERITED_CONTEXT_SYSTEM_PROMPT = """
-You are the VLN Waypoint Planner of an embodied navigation agent.
-Continue the Navigation step context by grounding its Navigation action to one available labeled waypoint candidate.
-Use the progress updates, Navigation reasoning, waypoint reference context, and candidate overlays as grounding evidence.
-Write concise grounding reasoning before the selected direction and candidate label.
+VLN_WAYPOINT_GROUNDING_SYSTEM_PROMPT = """
+You are the Waypoint Planner in NavClaw.
+Ground the fixed high-level navigation action into exactly one provided FSS world-space waypoint candidate and select the RGB view that best supports that grounding.
+Do not change the high-level action, update task progress, or retrieve historical evidence.
+Return only valid JSON matching the provided output contract.
 """.strip()
 
-VLN_WAYPOINT_ACTIVE_PROGRESS_SYSTEM_PROMPT = """
-You are a navigation agent.
-Continue the current navigation step by selecting one provided waypoint candidate and its clearest task-relevant RGB view based on the accumulated context.
-""".strip()
+VLN_WAYPOINT_INHERITED_CONTEXT_SYSTEM_PROMPT = VLN_WAYPOINT_GROUNDING_SYSTEM_PROMPT
+VLN_WAYPOINT_ACTIVE_PROGRESS_SYSTEM_PROMPT = VLN_WAYPOINT_GROUNDING_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -573,30 +571,7 @@ def _build_vln_active_progress_waypoint_prompt(
     *,
     loop_events: list[dict[str, object]],
 ) -> str:
-    retry_summary = _loop_context_summary(loop_events)
-    retry_section = (
-        f"Previous invalid selection:\n{retry_summary}\n\n"
-        if retry_summary != "none"
-        else ""
-    )
-    return f"""
-{retry_section}
-Rules:
-- Choose exactly one candidate_label and one selected_direction where that label is visible.
-- candidate_label identifies one provided world-space waypoint.
-- selected_direction identifies the RGB view that provides the clearest task-relevant evidence for the selected candidate.
-- Use the accumulated task progress, retrieval conclusions, and Navigation action reasoning to preserve the current navigation decision.
-- Use the RGB overlays to compare semantic and route relevance.
-- Use the candidate BEV to compare spatial direction and relative position.
-- Select the candidate that best advances the current Navigation action.
-
-Return exactly these JSON fields in the shown order:
-{{
-  "reasoning": "<why this candidate best advances the current Navigation action, based on the accumulated context and relevant RGB/BEV evidence>",
-  "selected_direction": "front",
-  "candidate_label": 1
-}}
-""".strip()
+    return _build_vln_inherited_waypoint_grounding_prompt(loop_events=loop_events)
 
 
 def _build_vln_inherited_waypoint_grounding_prompt(
@@ -605,40 +580,42 @@ def _build_vln_inherited_waypoint_grounding_prompt(
 ) -> str:
     retry_summary = _loop_context_summary(loop_events)
     retry_section = (
-        f"Previous invalid selection:\n{retry_summary}\n\n"
+        f"\n\nValidation feedback from the previous response:\n{retry_summary}\n"
+        "Return one corrected response using the same output contract."
         if retry_summary != "none"
         else ""
     )
-    grounding_rules = """
-- Compare candidates across all attached directional RGB overlays.
-- Compare candidate endpoint geometry in the candidate BEV.
-- Use the clearest projection when one candidate appears in multiple views.
-- Select visible connected walkable floor, stair tread or landing, doorway floor, corridor floor, or safe free space.
-- Reject walls, ceilings, furniture or object surfaces, clutter, windows, mirrors, and door leaves.
-""".strip()
-    reasoning_schema = (
-        "<compare candidate support for the inherited objective and cite the visible or "
-        "inherited evidence for the selected candidate>"
-    )
-    selection_rules = """
-- Choose exactly one candidate_label and one selected_direction where that label is visible.
-- candidate_label identifies the world-space waypoint; selected_direction identifies its grounding view.
-""".strip()
-    output_schema = f"""
-{{
-  "reasoning": "{reasoning_schema}",
-  "selected_direction": "front",
-  "candidate_label": 1
-}}
-""".strip()
     return f"""
-{retry_section}
-Rules:
-{selection_rules}
-{grounding_rules}
+Candidate semantics:
+- `candidate_label` identifies one provided world-space waypoint.
+- The same label in multiple RGB views refers to the same world-space waypoint.
+- `selected_direction` identifies the RGB view used to ground and explain the waypoint; it is not a second high-level navigation action.
+- The high-level action's `direction`, when present, constrains the world-space route direction. The selected grounding view may differ when the same candidate is clearer in another view.
+- White numbered circles are selectable waypoint candidates.
+- Blue numbered circles are visited-node overlays, not physical objects or selectable waypoints.
+- Landmark boxes and labels are visual evidence, not waypoint surfaces.
 
-Return exactly these JSON fields in the shown order:
-{output_schema}
+Selection rules:
+- Preserve the fixed high-level action and its parameters.
+- Select exactly one available label that is visible in the chosen grounding view.
+- Use updated progress and retrieval conclusions to interpret route intent; an unconfirmed condition is not an established fact.
+- Use directional RGB overlays to compare semantic route support and visible local passage structure.
+- Use the candidate BEV to compare candidate geometry, route direction, connectivity, and relative position.
+- Select a candidate on visible connected walking surface, doorway floor, corridor floor, stair tread or landing when applicable, or other safe free space.
+- Reject candidates projected onto a wall, ceiling, furniture or object surface, clutter, window, mirror, railing, or door leaf.
+- For an object or fixture reference, choose nearby reachable floor rather than the object surface.
+- The selected candidate's world-space position must advance the route direction and semantic objective specified by PCNP.
+- When one candidate appears in multiple views, choose the view that most clearly shows the relevant passage, target relation, or walking surface.
+- Do not select a candidate because its label is visually close to a landmark or node overlay.
+- Do not choose a different route branch because another candidate looks easier; route replanning belongs to PCNP.
+- `reasoning` identifies the decisive RGB and/or BEV evidence.
+
+Output contract:
+{{
+  "reasoning": "<concise grounding evidence for the fixed high-level action>",
+  "selected_direction": "front|back|left|right",
+  "candidate_label": 1
+}}{retry_section}
 """.strip()
 
 
@@ -775,14 +752,16 @@ def _waypoint_rgb_context_text(
 ) -> str:
     lines = [
         f"Waypoint RGB overlays: {len(view_candidate_sets)} directional views.",
-        "- Numbered circles are waypoint candidates.",
+        "- White numbered circles are selectable waypoint candidates.",
         "- The same label in multiple views is one world-space waypoint.",
     ]
     if include_graph_context:
-        lines.append("- Blue numbered circles are visited place nodes.")
+        lines.append(
+            "- Blue numbered circles are visited place-node overlays, not physical objects or selectable waypoints."
+        )
     if evidences != []:
         lines.append(
-            "- Landmark boxes display the numeric suffix of each canonical landmark ref."
+            "- Landmark boxes display the numeric suffix of each canonical landmark ref and are not waypoint surfaces."
         )
     return "\n".join(lines)
 
@@ -859,16 +838,6 @@ def _selected_sampled_candidate(
     reasoning = str(response.get("reasoning", "")).strip()
     if reasoning == "":
         return None, None, "candidate_selector_missing_reasoning"
-    response_fields = list(response)
-    if "reasoning" in response_fields:
-        reasoning_index = response_fields.index("reasoning")
-        selection_indices = [
-            response_fields.index(field_name)
-            for field_name in ("selected_direction", "candidate_label")
-            if field_name in response_fields
-        ]
-        if selection_indices and reasoning_index > min(selection_indices):
-            return None, None, "candidate_selector_reasoning_must_precede_selection"
     raw_label = response.get("candidate_label")
     if raw_label is None:
         return None, None, str(response.get("failure_reason", "candidate_selector_returned_null_label")).strip()

@@ -27,7 +27,7 @@ def current_panorama_prompt_text(
     planning_reference: bool = False,
 ) -> str:
     if planning_reference:
-        node_role = "Current planning node"
+        node_role = "Planning reference node"
     else:
         node_role = "Current graph node"
     visited_nodes_section = (
@@ -78,7 +78,7 @@ def image_content_for_current_panorama_views(
         direction = direction_for_angle(angle)
         if label_prefix is None:
             view_label = (
-                f"Current planner {direction} view:"
+                f"Planning reference {direction} view:"
                 if planning_reference
                 else f"Current {direction} view:"
             )

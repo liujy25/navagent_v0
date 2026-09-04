@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from navclaw.perception.detectors.interface import DetectorInterface
 
 
-LANDMARK_DETECTOR_BOX_THRESHOLD = 0.6
+LANDMARK_DETECTOR_BOX_THRESHOLD = 0.5
 LANDMARK_CLASS_MAP: dict[str, dict[str, object]] = {
     "door": {
         "class_name": "door",

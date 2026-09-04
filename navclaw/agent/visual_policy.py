@@ -8,6 +8,7 @@ import numpy as np
 
 from navclaw.agent.episodic_retrieval import RetrieveRequest
 from navclaw.agent.episodic_retrieval import normalize_retrieve_request
+from navclaw.agent.visual_action_context import direction_for_angle
 from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext
 from navclaw.agent.visual_policy_decisions import NavigationModeDecision
 from navclaw.agent.visual_policy_decisions import StopConfirmationDecision
@@ -16,6 +17,7 @@ from navclaw.agent.visual_policy_decisions import VisualActionPointDecision
 from navclaw.agent.visual_policy_decisions import VisualWaypointVerificationDecision
 from navclaw.agent.visual_policy_decisions import normalize_stop_confirmation
 from navclaw.agent.visual_policy_decisions import normalize_visual_action_point
+from navclaw.agent.visual_policy_decisions import normalize_vertical_transition_visual_action_point
 from navclaw.agent.visual_policy_decisions import normalize_visual_waypoint_verification
 from navclaw.agent.visual_policy_prompt_images import current_panorama_prompt_text
 from navclaw.agent.visual_policy_prompt_images import image_content_for_array
@@ -38,6 +40,7 @@ if TYPE_CHECKING:
 TRAJECTORY_RGB_KEYFRAME_DISTANCE_M = 0.8
 TRAJECTORY_RGB_KEYFRAME_YAW_DEG = 45.0
 VLN_PROGRESS_NAVIGATION_SEMANTIC_MAX_ATTEMPTS = 3
+VLN_HORIZONTAL_DIRECTIONS = {"front", "back", "left", "right"}
 
 
 def ensure_task_progress_memory(
@@ -57,34 +60,47 @@ def ensure_task_progress_memory(
     if task_progress.items != []:
         task_progress.ensure_current_task_started(current_node_id)
         return {"initialized": False, "source": "existing", "task_progress": task_progress.to_dict()}
-    system_prompt = """
-You are a task progress planner for an embodied navigation agent.
-You create concise task progress memory that helps the agent make stable navigation decisions.
-Return JSON only.
-""".strip()
     normalized_task_type = str(task_type).strip()
     if normalized_task_type not in {"", GOAL_KIND_VLN_INSTRUCTION}:
         raise ValueError("task progress supports VLN instructions only")
+    system_prompt = """
+You are the Initial Task Progress Generator in NavClaw.
+Convert the navigation instruction into an ordered list of route-level subtasks and a final stopping requirement when one is stated.
+Do not assess visual evidence, create online progress conditions, retrieve history, or choose a navigation action.
+Return only valid JSON matching the provided output contract.
+""".strip()
     user_prompt = f"""
-Navigation task:
+Navigation instruction:
 {goal_text}
 
-Create ordered progress items for this VLN instruction.
+Decision objective:
+Create the initial ordered task-progress items.
 
-Rules:
-- Each item should contain one action-driving route constraint, one route progress stage, or one final stopping condition from the instruction.
-- Preserve ordered route constraints such as "past X", "left/right of Y", "first door", "exit", "enter", "wait", and "stop".
-- If satisfying one constraint is a prerequisite before a later landmark, opening, room, or stop target should guide waypoint choice, split them into separate ordered items.
-- Keep descriptive target modifiers together when they identify the same target, such as "the door near X" or "the chair beside Y"; split only when the instruction requires completing one route constraint before pursuing the next.
-- Because the agent receives an all-around panorama, do not create pure orientation progress items such as "turn around", "look left", or "face X".
-- Use status "active" for every initial progress item.
-- Use result "" for active progress items.
+Task-item semantics:
+- Each item is one route-level subtask whose completion can later be assessed from navigation evidence, or one final stopping requirement.
+- TPU creates and maintains online evidence conditions during navigation.
+- The system maintains node associations outside item content.
 
-Return JSON only:
+Decomposition rules:
+- Preserve instruction order.
+- Create a new item when a distinct movement stage must be completed before the next stage should guide navigation.
+- Keep one movement and the landmarks or spatial relations that define that stage together.
+- Separate a prerequisite stage from a later target when the prerequisite must be completed before that target guides navigation.
+- Preserve route-defining relations such as pass, enter, exit, through, between, first/next, left/right of a landmark, and final stop/wait relations.
+- Keep descriptive modifiers with the target they identify.
+- Do not create a direction-only item for panorama reorientation such as "look left" or "face the door"; retain directional wording in the route stage it constrains.
+- Do not invent landmarks, rooms, turns, or intermediate actions.
+- Use concise action-oriented item content.
+
+Initialization rules:
+- Set every item status to "active".
+- Set every item result to an empty string.
+
+Output contract:
 {{
   "progress_items": [
     {{
-      "content": "<route progress item>",
+      "content": "<route-level subtask or final stopping requirement>",
       "status": "active",
       "result": ""
     }}
@@ -95,10 +111,30 @@ Return JSON only:
     source = "llm"
     try:
         parsed = client.generate_task_progress_memory(system_prompt, prompt_payload)
-        # Legacy input compatibility for older LLM traces or cached responses.
-        raw_items = parsed.get("progress_items", parsed.get("items", parsed.get("todos", [])))
+        if not isinstance(parsed, dict) or set(parsed) != {"progress_items"}:
+            raise ValueError(
+                "VLN initial task-progress output must contain only progress_items: "
+                f"{parsed!r}"
+            )
+        raw_items = parsed.get("progress_items", [])
         if not isinstance(raw_items, list) or raw_items == []:
             raise ValueError(f"visual task progress generator returned no progress_items: {parsed!r}")
+        expected_fields = {"content", "status", "result"}
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != expected_fields:
+                raise ValueError(
+                    "VLN initial task-progress items must contain exactly "
+                    f"{sorted(expected_fields)!r}: {item!r}"
+                )
+            if (
+                str(item.get("content", "")).strip() == ""
+                or str(item.get("status", "")).strip() != "active"
+                or str(item.get("result", "")).strip() != ""
+            ):
+                raise ValueError(
+                    "VLN initial task-progress items require non-empty content, "
+                    f"status='active', and result='': {item!r}"
+                )
         task_progress.items = [
             TaskProgressItem.from_dict(item)
             for item in raw_items
@@ -140,22 +176,14 @@ _VLN_NAVIGATION_TOOLS = {
 def _vln_progress_update_rules(node_binding_rule: str) -> str:
     return f"""
 Progress update rules:
-- Review ordered progress items and preserve explicit prerequisites.
+- Assess task-progress items in instruction order. Evidence may complete several consecutive items only when it independently establishes each one.
 {node_binding_rule}
-- Create and maintain progress conditions as independently verifiable atomic conditions required by their parent item, using the current observation and stored retrieval conclusions as evidence. `unconfirmed` means a condition is not yet confirmed; `confirmed` means evidence confirms that exact condition.
-- Represent target visibility and the instructed agent-target relation as separate conditions. Visibility may confirm a visibility condition, but the instructed relation requires executed evidence.
-- Progress conditions persist evidence-backed partial completion across navigation steps. `progress_condition_updates` is independent of item updates and may accompany either RETRIEVE or UPDATE_PROGRESS. With RETRIEVE, it records only evidence already available before the newly requested evidence is returned.
-- Set each item's `status` from the complete executed evidence for the item: `active` means its instructed state is not yet complete, and `done` means the complete instructed state is confirmed. Progress conditions are supporting reference memory; they need not enumerate every condition and do not determine the item status.
-- Each emitted item or condition update starts with a concise `thought` explaining why that operation is supported.
-- Leave `progress_updates` empty when no item memory change is supported. Otherwise each entry uses the fields for its operation:
-  - update: `thought,op,index,status,result`; it preserves existing task content.
-  - rewrite: `thought,op,index,content,status,result`.
-  - add: `thought,op,content,status,result`.
-  - insert: `thought,op,index,content,status,result`.
-  - remove: `thought,op,index`.
-- Every non-remove item update includes `result`: use an empty string for `active` and a non-empty completion summary for `done`.
-- Leave `progress_condition_updates` empty when no condition change is supported. Every entry identifies its parent with `item_index` and uses one operation: add=`thought,item_index,op,content,status`; update=`thought,item_index,op,condition_id,status`; rewrite=`thought,item_index,op,condition_id,content,status`; remove=`thought,item_index,op,condition_id`. In UPDATE_PROGRESS, `item_index` refers to the task memory after `progress_updates` are applied.
-- For multi-floor instructions, a stair landing or mid-stair platform is not a completed floor transition.
+- Mark a subtask `done` only when its required action and spatial relations have been completed. Keep it `active` when the target is only visible, only part of the relation is established, or decisive evidence is missing.
+- Reopen a `done` item only when current evidence directly invalidates the earlier completion judgment.
+- Add a condition only for a distinct partial-completion fact needed to assess its parent subtask. Do not add unrelated scene notes, duplicates, or a restatement of the full subtask.
+- `update` changes only a condition state. `rewrite` refines or corrects the same underlying fact. `remove` deletes only a duplicate, irrelevant, or invalid condition; missing evidence does not justify removing an unconfirmed condition.
+- Determine item status from the full subtask semantics and execution evidence, not by counting confirmed conditions.
+- If the evidence supports no condition change, omit `update_progress_conditions`. If it supports no item change, use an empty `progress_updates` list.
 """.strip()
 
 
@@ -181,7 +209,9 @@ def decide_vln_task_progress_step(
     allow_update_progress: bool,
     require_retrieval_conclusion: bool,
     retrieve_provided_fields_by_ref: dict[str, list[str]] | None = None,
+    memory_index_context_only: bool = False,
     progress_context_text: str = "",
+    backtrack_context_text: str = "",
     landmark_panorama_views: dict[int, np.ndarray] | None = None,
     detected_landmarks_text: str = "",
     terminal_check_context: dict[str, object] | None = None,
@@ -204,7 +234,9 @@ def decide_vln_task_progress_step(
         allow_navigation_actions=False,
         require_retrieval_conclusion=require_retrieval_conclusion,
         retrieve_provided_fields_by_ref=retrieve_provided_fields_by_ref,
+        memory_index_context_only=memory_index_context_only,
         progress_context_text=progress_context_text,
+        backtrack_context_text=backtrack_context_text,
         landmark_panorama_views=landmark_panorama_views,
         detected_landmarks_text=detected_landmarks_text,
         terminal_check_context=terminal_check_context,
@@ -226,6 +258,7 @@ def decide_vln_navigation_step(
     latest_task_progress: TaskProgressDecision,
     retrieval_workspace_content: list[dict[str, object]],
     progress_context_text: str = "",
+    backtrack_context_text: str = "",
     navigation_replan_feedback_text: str = "",
     landmark_panorama_views: dict[int, np.ndarray] | None = None,
     detected_landmarks_text: str = "",
@@ -252,17 +285,21 @@ def decide_vln_navigation_step(
         require_retrieval_conclusion=False,
         latest_task_progress=latest_task_progress,
         progress_context_text=progress_context_text,
+        backtrack_context_text=backtrack_context_text,
         navigation_replan_feedback_text=navigation_replan_feedback_text,
         landmark_panorama_views=landmark_panorama_views,
         detected_landmarks_text=detected_landmarks_text,
         allowed_backtrack_node_ids=allowed_backtrack_node_ids,
         require_backtrack=require_backtrack,
-        system_owned_waypoint_objective=system_owned_waypoint_objective,
+        system_owned_waypoint_objective=(
+            str(goal_kind).strip() == GOAL_KIND_VLN_INSTRUCTION
+            or system_owned_waypoint_objective
+        ),
         task_progress_bev_overlay=task_progress_bev_overlay,
         planning_reference_panorama=planning_reference_panorama,
     )
     if not isinstance(decision, NavigationModeDecision):
-        raise TypeError("Navigation Planner returned a task-progress decision")
+        raise TypeError("PCNP returned a task-progress decision")
     return decision
 
 
@@ -283,8 +320,10 @@ def _run_vln_task_module_prompt(
     allow_navigation_actions: bool,
     require_retrieval_conclusion: bool,
     retrieve_provided_fields_by_ref: dict[str, list[str]] | None = None,
+    memory_index_context_only: bool = False,
     latest_task_progress: TaskProgressDecision | None = None,
     progress_context_text: str = "",
+    backtrack_context_text: str = "",
     navigation_replan_feedback_text: str = "",
     landmark_panorama_views: dict[int, np.ndarray] | None = None,
     detected_landmarks_text: str = "",
@@ -308,77 +347,187 @@ def _run_vln_task_module_prompt(
     if require_backtrack and (
         not allow_navigation_actions or not allowed_backtrack_node_ids
     ):
-        raise ValueError("required BACKTRACK needs at least one available anchor")
+        raise ValueError("required `backtrack` needs at least one available anchor")
     terminal_check_required = isinstance(terminal_check_context, dict)
     if terminal_check_required and not allow_update_progress:
-        raise ValueError("post-approach terminal check requires UPDATE_PROGRESS")
+        raise ValueError("post-approach terminal check requires `update_progress`")
     tool_schemas: list[str] = []
-    conclusion_prefix = (
-        '"retrieval_conclusion":"<direct answer to the latest retrieval query; confirmed and missing evidence>",'
-        if require_retrieval_conclusion
-        else ""
-    )
-    progress_condition_field = '"progress_condition_updates":[],'
+    if allow_retrieve or allow_update_progress:
+        tool_schemas.append(
+            """### `update_progress_conditions`
+Purpose:
+- Apply evidence-backed changes to the dynamic condition sets of task-progress items.
+
+Use when:
+- At least one condition must be added, have its state updated, be rewritten, or be removed using evidence already in context.
+
+Arguments:
+- `condition_updates`: a non-empty list of condition operations.
+
+Operations:
+- `add` requires `op`, `item_index`, `content`, `status`, and `reason`.
+- `update` requires `op`, `item_index`, `condition_id`, `status`, and `reason`; it changes only the state.
+- `rewrite` requires `op`, `item_index`, `condition_id`, `content`, `status`, and `reason`; it preserves the underlying proposition while refining its wording.
+- `remove` requires `op`, `item_index`, `condition_id`, and `reason`.
+
+Constraints:
+- This call is optional. If present, it is the first entry in `tool_calls`.
+- Every operation states its decisive evidence in `reason`.
+- When the final call is `retrieve`, these operations use only evidence available before the requested fields are loaded.
+
+JSON:
+{"name":"update_progress_conditions","arguments":{"condition_updates":[{"op":"update","item_index":0,"condition_id":"pc0","status":"confirmed","reason":"<decisive evidence>"}]}}"""
+        )
     if allow_retrieve:
         tool_schemas.append(
-            "RETRIEVE:\n"
-            "{"
-            f"{conclusion_prefix}"
-            f"{progress_condition_field}"
-            '"retrieve":{"query":"<question to answer from stored episode evidence>",'
-            '"items":[{"ref":"<memory index ref>","fields":["<available field>"]}]}}'
+            """### `retrieve`
+Purpose:
+- Load selected historical entity fields needed to resolve one task-progress verification query.
+
+Use when:
+- Current evidence is insufficient for a concrete progress judgment and the memory index exposes evidence that can resolve it.
+
+Arguments:
+- `query`: one focused verification question.
+- `items`: a non-empty list of memory refs and requested available fields.
+
+Constraints:
+- Every ref and field exists in the supplied memory index.
+- Exclude fields already marked as provided.
+- Request the minimum sufficient evidence for the query.
+- This is the final entry in `tool_calls` and continues TPU reasoning in a later round.
+
+JSON:
+{"name":"retrieve","arguments":{"query":"<focused verification question>","items":[{"ref":"<memory ref>","fields":["<available field>"]}]}}"""
         )
     if allow_update_progress:
         terminal_check_schema = (
             ',"terminal_check":{'
             '"decision":"done|continue",'
-            '"reasoning":"<why the reached endpoint completes the task or what remains>",'
-            '"missing_constraints":["<unconfirmed instruction constraint>"]}'
+            '"reason":"<endpoint judgment>",'
+            '"missing_constraints":[]}'
             if terminal_check_required
             else ""
         )
         tool_schemas.append(
-            "UPDATE_PROGRESS:\n"
-            "{"
-            f"{conclusion_prefix}"
-            f"{progress_condition_field}"
-            '"update_progress":{'
-            '"progress_updates":[]'
-            f"{terminal_check_schema}" "}}"
+            """### `update_progress`
+Purpose:
+- Commit item-level status and result changes and end TPU reasoning for this decision step or planning reference.
+
+Arguments:
+- `progress_updates`: a list of item updates; use an empty list when no item change is supported.
+
+Operations:
+- Only `update` is allowed.
+- `update` requires `op`, `index`, `status`, `result`, and `reason`.
+- Item content, order, and count are immutable after initialization.
+
+Constraints:
+- `status` is `active` or `done`.
+- `result` is empty for `active` and a concise past-tense completion result for `done`.
+- Do not add, insert, rewrite, remove, reorder, or rename task-progress items.
+- A contradicted completion may be changed from `done` to `active` with an empty result and evidence-backed reason.
+- This is the final entry in `tool_calls` and ends the TPU retrieval loop.
+
+JSON:
+{"name":"update_progress","arguments":{"progress_updates":[{"op":"update","index":0,"status":"done","result":"Passed the pool.","reason":"<decisive execution evidence>"}]"""
+            + terminal_check_schema
+            + "}}"
         )
     if allow_navigation_actions:
         if allowed_backtrack_node_ids:
             allowed_backtrack_refs = ", ".join(
                 sorted(str(node_id) for node_id in allowed_backtrack_node_ids)
             )
+            required_anchor_constraint = (
+                "- This is the only available action in the current state."
+                if require_backtrack
+                else ""
+            )
             tool_schemas.append(
-                "BACKTRACK:\n"
-                f'{{"backtrack":{{"anchor_node_id":"<one of: {allowed_backtrack_refs}>",'
-                '"objective":"<what route choice to attempt from that node>",'
-                '"reason":"<why replanning from that reference node is needed>"}}'
+                f"""### `backtrack`
+Purpose:
+- Re-evaluate navigation from a previously visited anchor node by switching the planning reference to that node.
+
+Use when:
+- Historical evidence suggests that a required branch, turn, opening, or route choice may have been missed at an earlier visited location.
+- The committed task-progress state conflicts with the executed route and an earlier viewpoint must be reconsidered.
+- An earlier visited viewpoint can resolve a concrete route-recovery need better than the current planning reference.
+
+Arguments:
+- `anchor_node_id`: one of {allowed_backtrack_refs}.
+- `objective`: the route feature, branch, opening, or task relation to reassess from that anchor.
+- `reason`: the evidence-based reason to reconsider that viewpoint now.
+
+Constraints:
+{required_anchor_constraint}
+- Selecting `backtrack` does not physically move the robot.
+- TPU and PCNP rerun with the anchor observation and graph context as their planning reference.
+- The physical robot node remains unchanged until a later grounded movement is executed.
+- The anchor panorama is stored planning-reference evidence, not a fresh observation from the robot's physical pose.
+
+JSON:
+{{"backtrack":{{"anchor_node_id":"<one of: {allowed_backtrack_refs}>","objective":"<route relation to reassess>","reason":"<why this anchor is needed>"}}}}"""
             )
         if not require_backtrack:
-            go_to_waypoint_schema = (
-                'GO_TO_WAYPOINT:\n{"go_to_waypoint":{"reason":"<the concrete visible region or '
-                'relative route direction to enter next, and why it advances the current navigation intent>"}}'
-                if system_owned_waypoint_objective
-                else (
-                    "GO_TO_WAYPOINT:\n"
-                    '{"go_to_waypoint":{"objective":"<same-floor navigation objective>",'
-                    '"reason":"<why this is the next action>"}}'
-                )
-            )
             tool_schemas.extend(
                 [
-                    go_to_waypoint_schema,
-                    "APPROACH_TO_STOP:\n"
-                    '{"approach_to_stop":{"movement":"move|stay",'
-                    '"stop_objective":"<final locally reachable stopping region>",'
-                    '"reason":"<why this stopping region should be approached or retained>"}}',
-                    "VERTICAL_TRANSITION:\n"
-                    '{"vertical_transition":{"vertical_direction":"up|down",'
-                    '"reason":"<where the stairs are, why they are accessible from the current position, '
-                    'and why taking them up or down is the required next route step>"}}',
+                    """### `go_to_waypoint`
+Purpose:
+- Continue instruction following toward a locally groundable route or region.
+
+Use when:
+- The next step is neither a final stopping approach nor a floor transition.
+
+Arguments:
+- `direction`: the local panorama direction in which the world-space waypoint should advance the route.
+- `reason`: the visible route or region and its relation to the active task stage.
+
+Constraints:
+- Select the route direction from current evidence; do not copy an instruction direction that referred to an earlier pose.
+- The Waypoint Planner chooses the exact candidate.
+
+JSON:
+{"go_to_waypoint":{"direction":"front|back|left|right","reason":"<semantic local route intent>"}}""",
+                    """### `approach_to_stop`
+Purpose:
+- Perform the final local approach toward the expected stopping region. TPU performs the terminal check at the next decision step.
+
+Use when:
+- The expected stopping region is visible and the remaining task requires local positioning within or near it.
+
+Arguments:
+- `movement`: `move` for one local movement or `stay` when the observed pose already occupies the stopping region.
+- `direction`: required only for `move`; the local panorama direction of the approach.
+- `stop_objective`: the terminal spatial relation to establish.
+- `reason`: the visible evidence supporting the approach or stay proposal.
+
+Constraints:
+- This action does not declare the episode complete.
+- Target visibility at a distance is insufficient.
+
+JSON for `move`:
+{"approach_to_stop":{"movement":"move","direction":"front|back|left|right","stop_objective":"<terminal spatial relation>","reason":"<visible approach evidence>"}}
+
+JSON for `stay`:
+{"approach_to_stop":{"movement":"stay","stop_objective":"<terminal spatial relation at the observed pose>","reason":"<visible endpoint evidence>"}}""",
+                    """### `vertical_transition`
+Purpose:
+- Begin an up- or down-stair transition required by the current task stage.
+
+Use when:
+- The task requires a floor change and the corresponding stair route is visible and locally accessible.
+
+Arguments:
+- `vertical_direction`: `up` or `down`.
+- `reason`: the visible stair route, its accessibility, and why it is required now.
+
+Constraints:
+- A visible staircase unrelated to the active task stage does not justify this action.
+- The vertical-transition grounding modules choose the local movement points.
+
+JSON:
+{"vertical_transition":{"vertical_direction":"up|down","reason":"<visible required stair route>"}}""",
                 ]
             )
 
@@ -401,7 +550,7 @@ def _run_vln_task_module_prompt(
         )
         retrieval_catalog_section = f"""
 
-Episode memory index (text-only lookup):
+Episodic-memory text index:
 {memory_index_text if str(memory_index_text).strip() != "" else "none"}
 
 Retrieval budget for this navigation step:
@@ -411,22 +560,37 @@ Retrieval budget for this navigation step:
 {single_retrieval_instruction}
 """.rstrip()
         retrieval_semantics = """
-RETRIEVE tool:
-- The memory index is a compact text overview of the episode history.
-- Use RETRIEVE to inspect selected visual and movement evidence from that history.
-- Based on the evidence obtained so far, each subsequent RETRIEVE query must target the historical evidence still needed to determine or justify the current task-progress update.
-- `provided_fields` are already attached in the current planning observation; `available_fields` can be loaded with RETRIEVE.
-- Landmark refs use landmark_<global index>; landmark boxes display only the numeric suffix.
-- node.rgb is a stored node panorama; node.landmarks are detections on that panorama.
-- edge.rgb is the start-node view toward the endpoint, with the executed path and endpoint node overlaid.
-- edge.trajectory is the executed trajectory on the floor BEV; edge.movement_rgb is chronological traversal RGB.
-- landmark.rgb is stored detection RGB with its bounding box.
+Memory field semantics:
+- `node.rgb`: the node's stored multi-direction panorama.
+- `node.landmarks`: all landmark detections annotated in that panorama.
+- `edge.rgb`: the stored start view with the executed trajectory and endpoint overlaid.
+- `edge.trajectory`: the executed edge trajectory highlighted on the shared-floor BEV.
+- `edge.movement_rgb`: traversal RGB keyframes ordered chronologically from left to right and then top to bottom.
+- `landmark.rgb`: a local historical crop around the landmark with its bounding box.
+- `provided_fields` are already present in this context; `available_fields` may be requested.
+- Landmark refs use `landmark_<global index>`; image boxes display only the numeric suffix.
 """.strip()
+    elif memory_index_context_only:
+        retrieval_catalog_section = f"""
+
+Episodic-memory text index:
+{memory_index_text if str(memory_index_text).strip() != "" else "none"}
+
+Only the compact text index is available in this condition. No stored RGB, trajectory,
+landmark overlay, or graph BEV evidence is attached.
+""".rstrip()
     progress_context = str(progress_context_text).strip()
     progress_context_section = (
         f"\n\nCurrent-step context:\n{progress_context}"
         if progress_context != ""
         else ""
+    )
+    backtrack_context = str(backtrack_context_text).strip()
+    backtrack_context_section = (
+        f"Backtrack context:\n{backtrack_context}"
+        if backtrack_context != ""
+        and not backtrack_context.startswith("Backtrack context:")
+        else backtrack_context
     )
     latest_progress_section = ""
     if allow_navigation_actions and latest_task_progress is not None:
@@ -446,7 +610,7 @@ RETRIEVE tool:
             latest_progress_lines.extend(
                 [
                     f"terminal_check: {latest_task_progress.terminal_check_decision}",
-                    f"terminal_reasoning: {latest_task_progress.terminal_check_reasoning}",
+                    f"terminal_reason: {latest_task_progress.terminal_check_reasoning}",
                     "terminal_missing_constraints: "
                     + json.dumps(
                         latest_task_progress.terminal_check_missing_constraints,
@@ -463,32 +627,61 @@ RETRIEVE tool:
         else ""
     )
     landmark_text = str(detected_landmarks_text).strip()
-    landmark_section = f"\n\n{landmark_text}" if landmark_text != "" else ""
     conclusion_rules = (
         """
-Latest retrieval conclusion:
-- Write `retrieval_conclusion` before the selected tool.
-- Directly answer the latest retrieval query, distinguishing confirmed facts from missing evidence and naming the relevant refs concisely.
-- Previous retrieval conclusions and the cumulative BEV remain available; raw evidence is attached only for the latest unresolved retrieval.
+Latest unresolved retrieval round:
+- Raw evidence for the latest retrieval round is attached and has no conclusion yet.
+- `retrieval_conclusion` directly answers that query, names the supporting refs, and states any remaining evidence gap.
 """.strip()
         if require_retrieval_conclusion
         else ""
     )
+    task_progress_semantics = """
+Task-progress semantics:
+- A task-progress item is one ordered route-level subtask or final stopping requirement. Its content and order are fixed after initialization.
+- A progress condition is one evidence-checkable partial-completion fact under its parent subtask; it is supporting state, not a separate subtask.
+- TPU creates and revises conditions online to preserve partial progress and unresolved historical-verification needs.
+- `confirmed` means the available evidence establishes the exact condition.
+- `unconfirmed` means the condition is not established; it does not mean the condition is false.
+- Determine the parent status from the full subtask semantics and execution evidence; conditions are not a fixed completion checklist.
+- `result` is empty for an active item and a concise past-tense completion summary for a done item.
+- Start and completion node associations are system-owned and do not belong in item content, result, or condition content.
+""".strip()
+    evidence_retrieval_policy = """
+Evidence and retrieval policy:
+- Judge each progress relation only from evidence that establishes it. Seeing a target does not prove that the required movement, passage, turn, entry, approach, or stop relation was executed.
+- Use entity knowledge as a compact prior. Retrieve raw historical fields only when they can resolve a concrete subtask-status or condition judgment.
+- Do not retrieve for generic scene understanding, waypoint comparison, or unspecified additional context.
+- Each retrieval query asks one focused progress-verification question and requests only the entity fields needed to answer it.
+- After inspecting new evidence, answer the query, name the supporting refs, and state any remaining evidence gap.
+- A later query targets the remaining gap instead of repeating a resolved question.
+- When current evidence is sufficient, no suitable historical field exists, or the budget is exhausted, commit the evidence-backed progress state without inventing facts.
+- A retrieval request is not evidence; updates emitted with `retrieve` use only evidence available before the requested fields are loaded.
+""".strip()
+    navigation_state_semantics = """
+State semantics:
+- `confirmed` conditions are established by the available evidence.
+- `unconfirmed` conditions remain unresolved and must not be treated as completed facts.
+- Task-progress memory has already been committed by TPU. Do not modify or reinterpret its structure in this module.
+- Retrieval conclusions summarize inspected historical evidence. Use them as historical decision evidence; do not request raw fields from this module.
+""".strip()
     navigation_action_rules = (
-        f"""
-Navigation action tools:
-{("- BACKTRACK switches the current planning node to a prior node. Progress, retrieval, and navigation then continue from that node's stored context; the resulting action is executed from the physical robot pose." if allowed_backtrack_node_ids else "")}
-{("- The current planning node has no local exploration frontier. Select BACKTRACK to one of the available anchors." if require_backtrack else "- GO_TO_WAYPOINT continues same-floor waypoint planning from the current node.")}
-{("" if require_backtrack else "- APPROACH_TO_STOP prepares a locally reachable stopping pose: use `stay` when the current pose is that stopping region, or `move` when one local approach is needed.")}
-{("" if require_backtrack else "- VERTICAL_TRANSITION is used when the required upstairs or downstairs route is immediately visible and accessible from the current position.")}
+        """
+Action-selection rules:
+- Choose the action that best advances the earliest active route stage while remaining consistent with completed stages and confirmed conditions.
+- Use the current panorama to identify a visible and actionable local route, stopping region, or stair transition.
+- Use retrieval conclusions and the cumulative BEV to account for historical route evidence, visited locations, and traversed geometry.
+- Do not use an action choice to conceal unresolved task progress; TPU has already committed the evidence-supported state for this step.
+- Action parameters express semantic route intent, not a waypoint label, metric coordinate, or image point.
+- The action `reason` identifies the decisive visible route or historical evidence and explains how the action advances the current task stage.
+- Interpret directional task language in the current route context instead of copying a left/right word tied to an earlier pose.
+- After rejected local grounding, choose a newly supported objective rather than repeating the rejected route without new evidence.
 """.strip()
         if allow_navigation_actions
         else ""
     )
     node_binding_rule = (
-        "- Existing `node span: <start> -> <completion or pending>` annotations identify where "
-        "an item first became the current active item and where completion was first confirmed. The system maintains "
-        "these anchors; do not copy the annotation into task content."
+        "- `node span` is maintained by the system; do not copy it into `content` or `result`."
         if visual_context.graph_context_visible
         else ""
     )
@@ -499,9 +692,9 @@ Navigation action tools:
             terminal_check_context.get("movement", "move")
         ).strip()
         approach_result = (
-            "The APPROACH_TO_STOP decision retained the current pose."
+            "The `approach_to_stop` decision retained the current pose."
             if approach_movement == "stay"
-            else "The latest APPROACH_TO_STOP movement reached the current pose."
+            else "The latest `approach_to_stop` movement reached the current pose."
         )
         terminal_check_section = f"""
 
@@ -516,56 +709,89 @@ Approach objective:
 """.rstrip()
     system_prompt = (
         """
-You are the Progress-Conditioned Navigation Planner of an embodied navigation agent.
-Use the current observation, updated task-progress state, and retrieval conclusions to select the next high-level navigation action.
-Return JSON only.
+You are the Progress-Conditioned Navigation Planner (PCNP) in NavClaw.
+Choose exactly one high-level navigation action from the updated task-progress state, current observation, retrieval conclusions, and cumulative BEV when available.
+Do not update task progress, retrieve historical fields, or choose a metric waypoint or image point.
+Return only valid JSON matching one of the provided action contracts.
 """.strip()
         if allow_navigation_actions
         else """
-You are the Task Progress Updater of an embodied navigation agent.
-Use the current observation, task-progress memory, and retrieved episode evidence to resolve progress-relevant evidence gaps and update task progress.
-Return JSON only.
+You are the Task Progress Updater (TPU) in NavClaw.
+Assess task progress from the available evidence.
+If a specific progress judgment remains unresolved, retrieve the historical evidence needed to verify it; otherwise commit the progress update.
+Do not choose navigation actions or metric waypoints.
+Return only valid JSON matching the response protocol.
 """.strip()
     )
-    context_text = "\n\n".join(
-        section
-        for section in (
-            "Task progress memory:\n"
-            + task_progress.format_for_prompt(
-                include_node_bindings=visual_context.graph_context_visible,
-                show_empty_progress_conditions=True,
-            ),
-            progress_context_section.strip(),
-            replan_feedback_section.strip(),
-            terminal_check_section.strip(),
-            latest_progress_section.strip(),
+    task_progress_section = (
+        ("Updated task-progress memory:" if allow_navigation_actions else "Task progress memory:")
+        + "\n"
+        + task_progress.format_for_prompt(
+            include_node_bindings=visual_context.graph_context_visible,
+            show_empty_progress_conditions=True,
         )
-        if section != ""
+    )
+    response_protocol = (
+        ("Action contracts:\n\n" + "\n\n".join(tool_schemas))
+        if allow_navigation_actions
+        else (
+            "Tool definitions:\n\n"
+            + "\n\n".join(tool_schemas)
+            + "\n\nResponse protocol:\n"
+            + "- `tool_calls` contains one or two calls.\n"
+            + "- `update_progress_conditions` is optional; if present, it is first and contains at least one operation.\n"
+            + "- The final call is exactly one of `retrieve` or `update_progress`.\n"
+            + "- Include a non-empty top-level `retrieval_conclusion` only when raw evidence for the latest unresolved retrieval round is attached.\n"
+            + "- Otherwise omit `retrieval_conclusion`.\n"
+            + "- Include no other top-level fields.\n\n"
+            + "Without a new retrieval conclusion:\n"
+            + '{"tool_calls":[{"name":"<final tool name>","arguments":{}}]}\n\n'
+            + "With a new retrieval conclusion:\n"
+            + '{"retrieval_conclusion":"<direct answer to the latest verification query>","tool_calls":[{"name":"<final tool name>","arguments":{}}]}'
+        )
     )
     decision_text = "\n\n".join(
         section
         for section in (
+            navigation_state_semantics if allow_navigation_actions else task_progress_semantics,
             retrieval_semantics,
-            _vln_progress_update_rules(node_binding_rule) if allow_update_progress else "",
+            evidence_retrieval_policy
+            if allow_retrieve or allow_update_progress
+            else "",
+            _vln_progress_update_rules(node_binding_rule)
+            if allow_retrieve or allow_update_progress
+            else "",
             conclusion_rules,
             navigation_action_rules,
-            (
-                "Return exactly one of the following JSON objects. "
-                "Use exactly the shown fields:\n\n"
-                + chr(10).join(tool_schemas)
-            ),
+            response_protocol,
         )
         if section != ""
     )
     content: list[dict[str, object]] = [
-        {"type": "text", "text": context_text}
+        {"type": "text", "text": task_progress_section}
     ]
-    if retrieval_catalog_section != "":
-        content.append(
-            {"type": "text", "text": retrieval_catalog_section.strip()}
+    if progress_context_section != "":
+        content.append({"type": "text", "text": progress_context_section.strip()})
+    if not allow_navigation_actions and terminal_check_section != "":
+        content.append({"type": "text", "text": terminal_check_section.strip()})
+    if allow_navigation_actions and latest_progress_section != "":
+        content.append({"type": "text", "text": latest_progress_section.strip()})
+    if not allow_navigation_actions and backtrack_context_section != "":
+        content.append({"type": "text", "text": backtrack_context_section})
+    observation_reference_lines = [
+        (
+            f"Planning reference node: {visual_context.current_node_id}"
+            if planning_reference_panorama
+            else f"Observation reference node: {visual_context.current_node_id}"
         )
-    if landmark_section != "":
-        content.append({"type": "text", "text": landmark_section.strip()})
+    ]
+    if planning_reference_panorama:
+        observation_reference_lines.append(
+            "The attached panorama is stored planning-reference evidence, not a fresh observation from the robot's physical pose."
+        )
+    if landmark_text != "":
+        observation_reference_lines.append(landmark_text)
+    content.append({"type": "text", "text": "\n".join(observation_reference_lines)})
     panorama_text = current_panorama_prompt_text(
         visual_context,
         include_visited_nodes=visual_context.graph_context_visible,
@@ -624,13 +850,21 @@ Return JSON only.
                 {
                     "type": "text",
                     "text": (
-                        "Latest APPROACH_TO_STOP movement RGB, ordered "
-                        "left-to-right/top-to-bottom by time."
+                        "Post-approach movement RGB. Frames are ordered "
+                        "chronologically from left to right and then top to bottom."
                     ),
                 }
             )
             content.append(movement_history_content)
     content.extend(deepcopy(retrieval_workspace_content))
+    if retrieval_catalog_section != "":
+        content.append(
+            {"type": "text", "text": retrieval_catalog_section.strip()}
+        )
+    if allow_navigation_actions and replan_feedback_section != "":
+        content.append({"type": "text", "text": replan_feedback_section.strip()})
+    if allow_navigation_actions and backtrack_context_section != "":
+        content.append({"type": "text", "text": backtrack_context_section})
     content.append({"type": "text", "text": decision_text})
     retry_feedback = ""
     for attempt_index in range(VLN_PROGRESS_NAVIGATION_SEMANTIC_MAX_ATTEMPTS):
@@ -649,7 +883,7 @@ Return JSON only.
             if allow_navigation_actions:
                 if latest_task_progress is None:
                     raise ValueError(
-                        "Navigation Planner requires current task progress"
+                        "PCNP requires current task progress"
                     )
                 return normalize_vln_navigation_step(
                     parsed,
@@ -676,12 +910,11 @@ Return JSON only.
             ):
                 raise
             retry_feedback = (
-                "Previous invalid response:\n"
+                "Validation feedback from the previous response:\n"
                 f"{json.dumps(parsed, ensure_ascii=False, indent=2)}\n\n"
                 "Validation error:\n"
                 f"{exc}\n\n"
-                "Return one corrected complete JSON response using the same "
-                "output schema."
+                "Return one corrected response using the same output contract."
             )
     raise RuntimeError(
         "VLN progress-navigation semantic retry loop exited unexpectedly"
@@ -698,6 +931,7 @@ def _normalize_vln_progress_condition_updates(
         if not isinstance(raw_update, dict):
             raise ValueError(f"progress condition update must be an object: {raw_update!r}")
         op = str(raw_update.get("op", "")).strip().lower()
+        reason_field = _operation_reason_field(raw_update)
         raw_id_field = (
             "condition_id"
             if "condition_id" in raw_update
@@ -706,36 +940,31 @@ def _normalize_vln_progress_condition_updates(
             else "condition_id"
         )
         expected_fields = {
-            "add": {"thought", "item_index", "op", "content", "status"},
-            "update": {"thought", "item_index", "op", raw_id_field, "status"},
+            "add": {"op", "item_index", "content", "status", reason_field},
+            "update": {"op", "item_index", raw_id_field, "status", reason_field},
             "rewrite": {
-                "thought",
-                "item_index",
                 "op",
+                "item_index",
                 raw_id_field,
                 "content",
                 "status",
+                reason_field,
             },
-            "remove": {"thought", "item_index", "op", raw_id_field},
+            "remove": {"op", "item_index", raw_id_field, reason_field},
         }.get(op)
         if expected_fields is None or set(raw_update) != expected_fields:
             raise ValueError(f"invalid progress condition update fields: {raw_update!r}")
-        thought = str(raw_update.get("thought", "")).strip()
-        if thought == "":
-            raise ValueError(f"progress condition update requires thought: {raw_update!r}")
-        if next(iter(raw_update), None) != "thought":
-            raise ValueError(
-                f"progress condition update must write thought first: {raw_update!r}"
-            )
+        reason = str(raw_update.get(reason_field, "")).strip()
+        if reason == "":
+            raise ValueError(f"progress condition update requires reason: {raw_update!r}")
         item_index = raw_update.get("item_index")
         if not isinstance(item_index, int) or isinstance(item_index, bool):
             raise ValueError(
                 f"progress condition item_index must be an integer: {raw_update!r}"
             )
         item: dict[str, object] = {
-            "thought": thought,
-            "item_index": int(item_index),
             "op": op,
+            "item_index": int(item_index),
         }
         if raw_id_field in expected_fields:
             condition_id = str(raw_update.get(raw_id_field, "")).strip()
@@ -756,33 +985,29 @@ def _normalize_vln_progress_condition_updates(
             if status not in {"unconfirmed", "confirmed"}:
                 raise ValueError(f"invalid progress condition status: {raw_update!r}")
             item["status"] = status
+        item["reason"] = reason
         normalized.append(item)
     return normalized
 
 
 def _normalize_vln_progress_updates(raw_updates: object) -> list[dict[str, object]]:
     if not isinstance(raw_updates, list):
-        raise ValueError("UPDATE_PROGRESS progress_updates must be a list")
+        raise ValueError("update_progress progress_updates must be a list")
     normalized: list[dict[str, object]] = []
     for raw_update in raw_updates:
         if not isinstance(raw_update, dict):
             raise ValueError(f"progress update must be an object: {raw_update!r}")
         op = str(raw_update.get("op", "")).strip().lower()
-        if op not in {"update", "rewrite", "add", "insert", "remove"}:
-            raise ValueError(f"progress update has unsupported op: {raw_update!r}")
-        if str(raw_update.get("thought", "")).strip() == "":
-            raise ValueError(f"progress update requires thought: {raw_update!r}")
-        if next(iter(raw_update), None) != "thought":
-            raise ValueError(f"progress update must write thought first: {raw_update!r}")
-        expected_fields = {"thought", "op"}
-        if op in {"update", "rewrite", "insert", "remove"}:
-            expected_fields.add("index")
-        if op == "rewrite":
-            expected_fields.add("content")
-        if op != "remove":
-            expected_fields.update({"status", "result"})
-        if op in {"add", "insert"}:
-            expected_fields.add("content")
+        if op != "update":
+            raise ValueError(
+                "task-progress item content and order are immutable; only "
+                f"op='update' is allowed: {raw_update!r}"
+            )
+        reason_field = _operation_reason_field(raw_update)
+        reason = str(raw_update.get(reason_field, "")).strip()
+        if reason == "":
+            raise ValueError(f"progress update requires reason: {raw_update!r}")
+        expected_fields = {"op", "index", "status", "result", reason_field}
         if set(raw_update) != expected_fields:
             raise ValueError(
                 f"{op} progress update fields must be exactly "
@@ -793,25 +1018,39 @@ def _normalize_vln_progress_updates(raw_updates: object) -> list[dict[str, objec
             or isinstance(raw_update.get("index"), bool)
         ):
             raise ValueError(f"progress update index must be an integer: {raw_update!r}")
-        if "content" in expected_fields and str(raw_update.get("content", "")).strip() == "":
-            raise ValueError(f"progress update requires content: {raw_update!r}")
-        item = dict(raw_update)
-        if "status" in expected_fields:
-            status = str(raw_update.get("status", "")).strip().lower()
-            if status not in {"active", "done"}:
-                raise ValueError(f"invalid progress item status: {raw_update!r}")
-            item["status"] = status
-        if op != "remove":
-            if item["status"] == "done":
-                if str(raw_update.get("result", "")).strip() == "":
-                    raise ValueError(f"done progress update requires result: {raw_update!r}")
-                item["result"] = str(raw_update.get("result", "")).strip()
-            elif str(raw_update.get("result", "")).strip() != "":
-                raise ValueError(f"active progress update requires empty result: {raw_update!r}")
-            else:
-                item["result"] = ""
+        status = str(raw_update.get("status", "")).strip().lower()
+        if status not in {"active", "done"}:
+            raise ValueError(f"invalid progress item status: {raw_update!r}")
+        item: dict[str, object] = {
+            "op": op,
+            "index": int(raw_update["index"]),
+            "status": status,
+        }
+        if status == "done":
+            if str(raw_update.get("result", "")).strip() == "":
+                raise ValueError(f"done progress update requires result: {raw_update!r}")
+            item["result"] = str(raw_update.get("result", "")).strip()
+        elif str(raw_update.get("result", "")).strip() != "":
+            raise ValueError(f"active progress update requires empty result: {raw_update!r}")
+        else:
+            item["result"] = ""
+        item["reason"] = reason
         normalized.append(item)
     return normalized
+
+
+def _operation_reason_field(raw_update: dict[str, object]) -> str:
+    fields = [
+        field_name
+        for field_name in ("reason", "thought", "reasoning")
+        if field_name in raw_update
+    ]
+    if len(fields) != 1:
+        raise ValueError(
+            "operation must contain exactly one reason field; canonical output "
+            f"uses reason: {raw_update!r}"
+        )
+    return fields[0]
 
 
 def normalize_vln_task_progress_step(
@@ -881,7 +1120,7 @@ def _normalize_vln_task_module_step(
     require_terminal_check: bool = False,
 ) -> TaskProgressDecision | RetrieveRequest | NavigationModeDecision:
     module_name = (
-        "Navigation Planner"
+        "Progress-Conditioned Navigation Planner (PCNP)"
         if allow_navigation_actions
         else "Task Progress Updater"
     )
@@ -890,6 +1129,11 @@ def _normalize_vln_task_module_step(
         if allow_navigation_actions
         else _VLN_TASK_PROGRESS_TOOLS
     )
+    if not allow_navigation_actions and "tool_calls" in payload:
+        payload = _normalize_vln_tpu_tool_calls(
+            payload,
+            require_retrieval_conclusion=require_retrieval_conclusion,
+        )
     selected_tools = [name for name in module_tools if name in payload]
     if len(selected_tools) != 1:
         raise ValueError(
@@ -899,7 +1143,7 @@ def _normalize_vln_task_module_step(
     selected_tool = selected_tools[0]
     if require_backtrack and selected_tool != "backtrack":
         raise ValueError(
-            f"only BACKTRACK is available in this state: {payload!r}"
+            f"only backtrack is available in this state: {payload!r}"
         )
     expected_top_fields = {selected_tool}
     if require_retrieval_conclusion:
@@ -926,11 +1170,6 @@ def _normalize_vln_task_module_step(
             f"{module_name} returned unexpected top-level fields: "
             f"{payload!r}"
         )
-    if require_retrieval_conclusion and next(iter(payload)) != "retrieval_conclusion":
-        raise ValueError(
-            "Task Progress Updater must write retrieval_conclusion before "
-            f"its next tool: {payload!r}"
-        )
     retrieval_conclusion = str(payload.get("retrieval_conclusion", "")).strip()
     if require_retrieval_conclusion and retrieval_conclusion == "":
         raise ValueError(
@@ -940,7 +1179,7 @@ def _normalize_vln_task_module_step(
 
     if selected_tool == "retrieve":
         if not allow_retrieve:
-            raise ValueError(f"RETRIEVE is not available in this state: {payload!r}")
+            raise ValueError(f"retrieve is not available in this state: {payload!r}")
         progress_condition_updates = _normalize_vln_progress_condition_updates(
             payload.get(condition_updates_field)
         )
@@ -963,13 +1202,13 @@ def _normalize_vln_task_module_step(
         raise ValueError(f"{selected_tool} tool payload must be an object: {payload!r}")
     if selected_tool == "update_progress":
         if not allow_update_progress:
-            raise ValueError(f"UPDATE_PROGRESS is not available in this state: {payload!r}")
+            raise ValueError(f"update_progress is not available in this state: {payload!r}")
         expected_fields = {"progress_updates"}
         if require_terminal_check:
             expected_fields.add("terminal_check")
         if set(raw_tool) != expected_fields:
             raise ValueError(
-                "UPDATE_PROGRESS fields must be exactly "
+                "update_progress fields must be exactly "
                 f"{sorted(expected_fields)!r}: {payload!r}"
             )
         try:
@@ -988,9 +1227,10 @@ def _normalize_vln_task_module_step(
             raw_terminal_check = raw_tool.get("terminal_check")
             if not isinstance(raw_terminal_check, dict):
                 raise ValueError(f"UPDATE_PROGRESS terminal_check must be an object: {payload!r}")
+            terminal_reason_field = _operation_reason_field(raw_terminal_check)
             expected_terminal_fields = {
                 "decision",
-                "reasoning",
+                terminal_reason_field,
                 "missing_constraints",
             }
             if set(raw_terminal_check) != expected_terminal_fields:
@@ -1002,13 +1242,13 @@ def _normalize_vln_task_module_step(
                 raw_terminal_check.get("decision", "")
             ).strip()
             terminal_check_reasoning = str(
-                raw_terminal_check.get("reasoning", "")
+                raw_terminal_check.get(terminal_reason_field, "")
             ).strip()
             raw_missing_constraints = raw_terminal_check.get("missing_constraints")
             if terminal_check_decision not in {"done", "continue"}:
                 raise ValueError(f"terminal_check decision must be done or continue: {payload!r}")
             if terminal_check_reasoning == "":
-                raise ValueError(f"terminal_check requires reasoning: {payload!r}")
+                raise ValueError(f"terminal_check requires reason: {payload!r}")
             if not isinstance(raw_missing_constraints, list):
                 raise ValueError(f"terminal_check missing_constraints must be a list: {payload!r}")
             terminal_check_missing_constraints = [
@@ -1034,7 +1274,7 @@ def _normalize_vln_task_module_step(
         )
 
     if not allow_navigation_actions or latest_task_progress is None:
-        raise ValueError(f"{selected_tool} is not available before UPDATE_PROGRESS: {payload!r}")
+        raise ValueError(f"{selected_tool} is not available before update_progress: {payload!r}")
     progress_fields = {
         "progress_analysis": "",
         "progress_reasoning": "",
@@ -1043,14 +1283,14 @@ def _normalize_vln_task_module_step(
     if selected_tool == "backtrack":
         expected_fields = {"anchor_node_id", "objective", "reason"}
         if set(raw_tool) != expected_fields:
-            raise ValueError(f"BACKTRACK fields must be exactly {sorted(expected_fields)!r}: {payload!r}")
+            raise ValueError(f"backtrack fields must be exactly {sorted(expected_fields)!r}: {payload!r}")
         anchor_node_id = str(raw_tool.get("anchor_node_id", "")).strip()
         objective = str(raw_tool.get("objective", "")).strip()
         reason = str(raw_tool.get("reason", "")).strip()
         if allowed_backtrack_node_ids is not None and anchor_node_id not in allowed_backtrack_node_ids:
-            raise ValueError(f"BACKTRACK selected unavailable anchor node: {payload!r}")
+            raise ValueError(f"backtrack selected unavailable anchor node: {payload!r}")
         if anchor_node_id == "" or objective == "" or reason == "":
-            raise ValueError(f"BACKTRACK requires anchor, objective, and reason: {payload!r}")
+            raise ValueError(f"backtrack requires anchor, objective, and reason: {payload!r}")
         return NavigationModeDecision(
             action_mode="backtrack",
             stop_objective="",
@@ -1065,48 +1305,66 @@ def _normalize_vln_task_module_step(
         )
     if selected_tool == "go_to_waypoint":
         expected_fields = (
-            {"reason"}
+            {"direction", "reason"}
             if system_owned_waypoint_objective
             else {"objective", "reason"}
         )
         if set(raw_tool) != expected_fields:
-            raise ValueError(f"GO_TO_WAYPOINT fields must be exactly {sorted(expected_fields)!r}: {payload!r}")
+            raise ValueError(f"go_to_waypoint fields must be exactly {sorted(expected_fields)!r}: {payload!r}")
         objective = str(raw_tool.get("objective", "")).strip()
+        direction = str(raw_tool.get("direction", "")).strip()
         reason = str(raw_tool.get("reason", "")).strip()
-        if reason == "" or (not system_owned_waypoint_objective and objective == ""):
-            raise ValueError(f"GO_TO_WAYPOINT requires its shown fields: {payload!r}")
+        if (
+            reason == ""
+            or (system_owned_waypoint_objective and direction not in VLN_HORIZONTAL_DIRECTIONS)
+            or (not system_owned_waypoint_objective and objective == "")
+        ):
+            raise ValueError(f"go_to_waypoint requires its shown fields: {payload!r}")
         return NavigationModeDecision(
             action_mode="go_to_waypoint",
             stop_objective="",
             reasoning_action=reason if system_owned_waypoint_objective else objective,
+            direction=direction,
             route_status="",
             action_objective=objective,
             action_reason=reason,
             **progress_fields,
         )
     if selected_tool == "approach_to_stop":
+        movement = str(raw_tool.get("movement", "")).strip()
         expected_fields = {"movement", "stop_objective", "reason"}
+        if system_owned_waypoint_objective and movement == "move":
+            expected_fields.add("direction")
         if set(raw_tool) != expected_fields:
             raise ValueError(
-                "APPROACH_TO_STOP fields must be exactly "
+                "approach_to_stop fields must be exactly "
                 f"{sorted(expected_fields)!r}: {payload!r}"
             )
-        movement = str(raw_tool.get("movement", "")).strip()
+        direction = str(raw_tool.get("direction", "")).strip()
         stop_objective = str(raw_tool.get("stop_objective", "")).strip()
         reason = str(raw_tool.get("reason", "")).strip()
         if movement not in {"move", "stay"}:
             raise ValueError(
-                f"APPROACH_TO_STOP movement must be move or stay: {payload!r}"
+                f"approach_to_stop movement must be move or stay: {payload!r}"
             )
         if stop_objective == "" or reason == "":
             raise ValueError(
-                f"APPROACH_TO_STOP requires stop_objective and reason: {payload!r}"
+                f"approach_to_stop requires stop_objective and reason: {payload!r}"
+            )
+        if (
+            system_owned_waypoint_objective
+            and movement == "move"
+            and direction not in VLN_HORIZONTAL_DIRECTIONS
+        ):
+            raise ValueError(
+                f"moving approach_to_stop requires a horizontal direction: {payload!r}"
             )
         return NavigationModeDecision(
             action_mode="approach_to_stop",
             approach_movement=movement,
             stop_objective=stop_objective,
             reasoning_action=reason,
+            direction=direction,
             route_status="",
             action_objective=stop_objective,
             action_reason=reason,
@@ -1115,11 +1373,11 @@ def _normalize_vln_task_module_step(
     if selected_tool == "vertical_transition":
         expected_fields = {"vertical_direction", "reason"}
         if set(raw_tool) != expected_fields:
-            raise ValueError(f"VERTICAL_TRANSITION fields must be exactly {sorted(expected_fields)!r}: {payload!r}")
+            raise ValueError(f"vertical_transition fields must be exactly {sorted(expected_fields)!r}: {payload!r}")
         vertical_direction = str(raw_tool.get("vertical_direction", "")).strip()
         reason = str(raw_tool.get("reason", "")).strip()
         if vertical_direction not in {"up", "down"} or reason == "":
-            raise ValueError(f"VERTICAL_TRANSITION requires direction and reason: {payload!r}")
+            raise ValueError(f"vertical_transition requires direction and reason: {payload!r}")
         return NavigationModeDecision(
             action_mode="vertical_transition",
             stop_objective="",
@@ -1131,6 +1389,74 @@ def _normalize_vln_task_module_step(
             **progress_fields,
         )
     raise ValueError(f"unsupported VLN progress-navigation tool: {payload!r}")
+
+
+def _normalize_vln_tpu_tool_calls(
+    payload: dict[str, object],
+    *,
+    require_retrieval_conclusion: bool,
+) -> dict[str, object]:
+    expected_top_fields = {"tool_calls"}
+    if require_retrieval_conclusion:
+        expected_top_fields.add("retrieval_conclusion")
+    if set(payload) != expected_top_fields:
+        raise ValueError(
+            "Task Progress Updater returned unexpected top-level fields: "
+            f"{payload!r}"
+        )
+    if require_retrieval_conclusion:
+        if str(payload.get("retrieval_conclusion", "")).strip() == "":
+            raise ValueError(
+                "Task Progress Updater must conclude the latest retrieval "
+                f"before its next tool: {payload!r}"
+            )
+    raw_calls = payload.get("tool_calls")
+    if not isinstance(raw_calls, list) or not (1 <= len(raw_calls) <= 2):
+        raise ValueError("tool_calls must contain one or two calls")
+    calls: list[tuple[str, dict[str, object]]] = []
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict) or set(raw_call) != {"name", "arguments"}:
+            raise ValueError(f"invalid TPU tool call: {raw_call!r}")
+        name = str(raw_call.get("name", "")).strip()
+        arguments = raw_call.get("arguments")
+        if not isinstance(arguments, dict):
+            raise ValueError(f"TPU tool arguments must be an object: {raw_call!r}")
+        calls.append((name, arguments))
+    final_name, final_arguments = calls[-1]
+    if final_name not in {"retrieve", "update_progress"}:
+        raise ValueError(
+            "the final TPU call must be exactly retrieve or update_progress"
+        )
+    condition_updates: list[object] = []
+    if len(calls) == 2:
+        condition_name, condition_arguments = calls[0]
+        if condition_name != "update_progress_conditions":
+            raise ValueError(
+                "update_progress_conditions is the only optional first TPU call"
+            )
+        if set(condition_arguments) != {"condition_updates"}:
+            raise ValueError(
+                "update_progress_conditions arguments must contain exactly "
+                "condition_updates"
+            )
+        raw_condition_updates = condition_arguments.get("condition_updates")
+        if not isinstance(raw_condition_updates, list) or raw_condition_updates == []:
+            raise ValueError(
+                "update_progress_conditions requires non-empty condition_updates"
+            )
+        condition_updates = raw_condition_updates
+    elif calls[0][0] == "update_progress_conditions":
+        raise ValueError(
+            "update_progress_conditions cannot be the final TPU call"
+        )
+    normalized: dict[str, object] = {}
+    if require_retrieval_conclusion:
+        normalized["retrieval_conclusion"] = str(
+            payload.get("retrieval_conclusion", "")
+        ).strip()
+    normalized["progress_condition_updates"] = condition_updates
+    normalized[final_name] = final_arguments
+    return normalized
 
 
 
@@ -1235,6 +1561,98 @@ Return JSON only:
     )
 
 
+def decide_vertical_transition_visual_action_point(
+    *,
+    client: "LLMClient",
+    cache: "RuntimeCache",
+    selected_view: VisualViewContext,
+    waypoint_target: str,
+    revision_feedback: str = "",
+    rejected_point_2d: tuple[float, float] | None = None,
+) -> VisualActionPointDecision:
+    feedback_text = str(revision_feedback).strip()
+    revision_section = ""
+    if feedback_text != "":
+        rejected_point_text = (
+            ""
+            if rejected_point_2d is None
+            else (
+                "\nRejected point_2d: "
+                f"[{float(rejected_point_2d[0]):.4f}, "
+                f"{float(rejected_point_2d[1]):.4f}]"
+            )
+        )
+        revision_section = f"""
+Revision feedback:
+{feedback_text}{rejected_point_text}
+""".strip()
+    system_prompt = """
+You are the Vertical Transition Visual Action Grounder in NavClaw.
+Ground the fixed waypoint target in the supplied RGB view by either selecting one normalized image point on the intended reachable walking surface or explicitly reporting that no valid point is available.
+Do not change the waypoint target or decide whether the overall floor transition is complete.
+Return only valid JSON matching the provided output contract.
+""".strip()
+    text = f"""
+Waypoint target:
+{waypoint_target}
+
+Decision objective:
+Ground the fixed waypoint target in this RGB view.
+
+Point semantics:
+- `point_2d` uses normalized image coordinates `[x, y]`, with `[0,0]` at the top-left and `[1,1]` at the bottom-right.
+- A successful point lies on the walking surface that realizes the waypoint target, not on a referenced object, door leaf, railing, wall, or overlay.
+- Revision feedback rejects the previous point or image region for this target.
+- A corrected region or image-local direction in revision feedback applies only when it remains consistent with the fixed waypoint target.
+
+Grounding rules:
+- Select reachable floor, stair tread or landing, doorway floor, corridor floor, or other safe walking surface that matches the target.
+- Reject walls, ceilings, furniture or object surfaces, clutter, windows, mirrors, railings, and door leaves.
+- For an object or fixture reference, ground to nearby reachable floor.
+- For a doorway or corridor target, ground to the open walking passage.
+- Report failure when no safe matching region is visible.
+""".strip()
+    output_text = """
+Output contract:
+
+Success:
+{
+  "status": "success",
+  "reasoning": "<brief visible evidence that the point safely grounds the fixed target>",
+  "point_2d": [0.42, 0.81],
+  "target": "<grounded target region>",
+  "failure_reason": ""
+}
+
+Failure:
+{
+  "status": "failure",
+  "reasoning": "<brief visible evidence that no safe matching point is available>",
+  "point_2d": null,
+  "target": "",
+  "failure_reason": "<why no valid point can be selected>"
+}
+""".strip()
+    content: list[dict[str, object]] = [{"type": "text", "text": text}]
+    if revision_section != "":
+        content.append({"type": "text", "text": revision_section})
+    content.extend(
+        [
+            {
+                "type": "text",
+                "text": (
+                    "Selected RGB image for "
+                    f"{direction_for_angle(selected_view.angle_deg)}:"
+                ),
+            },
+            image_content_for_view(cache=cache, view=selected_view),
+            {"type": "text", "text": output_text},
+        ]
+    )
+    parsed = client.decide_visual_action(system_prompt, content)
+    return normalize_vertical_transition_visual_action_point(parsed)
+
+
 def verify_vertical_transition_waypoint(
     *,
     client: "LLMClient",
@@ -1290,36 +1708,38 @@ Geometry evidence:
         point_pixel=point_pixel,
     )
     system_prompt = """
-You judge one marked local waypoint for a stair transition.
-The agent wants to go upstairs or downstairs.
-Decide whether the red dot matches the waypoint target and is a valid next movement point.
-Return JSON only.
+You are the Vertical Transition Waypoint Verifier in NavClaw.
+Validate whether the marked image point is a reachable next local movement point that matches the fixed waypoint target and requested vertical direction.
+Do not decide whether the overall floor transition is complete.
+Return only valid JSON matching the provided output contract.
 """.strip()
     text = f"""
 Requested transition:
 {instruction}
 
-Waypoint target:
+Fixed waypoint target:
 {waypoint_target}
 {geometry_warning_section}
 
-Rules:
-- The red dot marks the selected waypoint.
-- The red dot must match the waypoint target; a reachable but mismatched floor point is not enough for "execute".
-- Return "execute" only if the red dot matches the waypoint target, is reachable, and moving to it is a valid next step for the requested up/down stair transition.
-- On the next-floor surface, the red dot must be on the first stable floor immediately beyond the final tread, not farther along the corridor or room.
+Verdict semantics:
+- `execute`: the red dot matches the waypoint target, lies on reachable walking surface, and is a valid next local move for the requested transition.
+- `revise_same_view`: this view contains a better reachable point for the same target and vertical direction.
+- `fallback_navigation`: this view or target does not admit a valid point for the requested transition; return control to the Vertical Transition Step Planner.
+- `fail`: the supplied image or overlay is unusable for validation.
+
+Validation rules:
+- A reachable point is insufficient when it does not match the waypoint target.
+- The point must lie on walking surface, not on a wall, furniture, object, railing, door leaf, window, mirror, or clutter.
+- For a destination-floor target, the point must be on the first safe floor region immediately beyond the final tread rather than farther along the corridor or room.
+- Do not predict whether executing this point completes the floor transition; the Step Planner assesses completion from the next fresh observation.
 {revise_rule}
-- Return "fallback_navigation" if the red dot is in the wrong vertical direction or this view does not provide a valid next point.
-- Return "fail" only if the image is unusable.
-- A valid point must be on reachable walking surface, not on walls, furniture, railings, doors, windows, or clutter.
 {critique_rule}
-- If you return "execute", critique must briefly state why the red dot matches the waypoint target and requested vertical direction.
-- If you return "fallback_navigation" or "fail", critique must briefly state the blocking reason.
+- For verdicts other than `revise_same_view`, `critique` is one concise evidence-based sentence.
 """.strip()
     output_text = f"""
-Return JSON only:
+Output contract:
 {{
-  "critique": "<brief reason; for revise_same_view use two short sentences>",
+  "critique": "<concise evidence; two short sentences for revise_same_view>",
   "verdict": "{verdict_values}"
 }}
 """.strip()

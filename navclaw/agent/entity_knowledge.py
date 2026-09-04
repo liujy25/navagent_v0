@@ -46,37 +46,59 @@ def manage_retrieved_knowledge(
     }
     retrieval_rounds = [
         {
-            "round_index": int(round_record.round_index),
+            "round": int(round_record.round_index) + 1,
             "query": str(round_record.request.query),
-            "items": [item.to_dict() for item in round_record.request.items],
+            "request": [item.to_dict() for item in round_record.request.items],
             "conclusion": str(round_record.conclusion),
         }
         for round_record in workspace.rounds
     ]
     system_prompt = """
-You are the Knowledge Manager for an embodied navigation episode.
-Maintain compact reusable knowledge for the retrieved graph entities and return JSON only.
+You are the Entity Knowledge Manager (EKM) in NavClaw.
+Convert evidence-grounded retrieval conclusions into compact reusable knowledge for the entities retrieved in the current decision step.
+Do not change task progress, reinterpret raw visual evidence, or alter the selected high-level action.
+Return only valid JSON matching the provided output contract.
 """.strip()
     user_prompt = f"""
 Retrieved entity refs:
 {json.dumps(refs, ensure_ascii=False)}
 
-Retrieval rounds:
+Retrieval trace:
 {json.dumps(retrieval_rounds, ensure_ascii=False, indent=2)}
 
-Progress updates:
+Committed task-progress updates:
 {json.dumps(progress_updates, ensure_ascii=False, indent=2)}
 
 Existing entity knowledge:
 {json.dumps(existing, ensure_ascii=False, indent=2)}
 
-Produce only compact entity-local facts supported by the retrieval conclusions. Add a distinct new fact, update an existing fact when it is refined or corrected, and remove an existing fact when it is no longer valid. Return an empty update list when nothing reusable changes.
+Decision objective:
+Update only the retrieved entities with compact facts that remain useful beyond the current decision step.
 
-Return exactly:
+Retrieval-trace semantics:
+- Each round contains its verification query, the entity-field request that was materialized, and TPU's conclusion from that evidence.
+- A fact written to an entity must be supported by a conclusion derived from evidence requested from that entity.
+- Use only details stated in the supplied conclusions; raw retrieved images are not provided to this module.
+
+Entity-knowledge semantics:
+- Entity knowledge is a concise retrieval-derived fact associated with one node, edge, or landmark.
+- It is not raw observation data, a task-progress condition, a temporary query, or a navigation command.
+
+Update rules:
+- Use only refs listed in `Retrieved entity refs`.
+- Add a fact when it is distinct, supported, entity-local, and applicable beyond the current decision step.
+- Update an existing fact when the retrieval trace refines or corrects the same claim.
+- Remove an existing fact only when the retrieval trace establishes that it is invalid; absence of new support is insufficient.
+- Do not create duplicates or paraphrased copies of existing knowledge.
+- Do not store the current action choice, waypoint candidate, temporary uncertainty, retrieval query wording, or policy advice.
+- Task-progress updates may establish why a fact matters but are not independent evidence about an entity.
+- Return an empty list when no reusable entity knowledge changes.
+
+Output contract:
 {{
   "entity_knowledge_updates": [
-    {{"op":"add","ref":"<retrieved ref>","content":"<knowledge>"}},
-    {{"op":"update","ref":"<retrieved ref>","knowledge_id":"<existing id>","content":"<knowledge>"}},
+    {{"op":"add","ref":"<retrieved ref>","content":"<compact entity-local fact>"}},
+    {{"op":"update","ref":"<retrieved ref>","knowledge_id":"<existing id>","content":"<corrected or refined fact>"}},
     {{"op":"remove","ref":"<retrieved ref>","knowledge_id":"<existing id>"}}
   ]
 }}
