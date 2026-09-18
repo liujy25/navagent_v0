@@ -11,8 +11,8 @@ language navigation (VLN) agent. It contains one algorithm configuration:
 - observation-grounded stair FSS and local vertical movements;
 - YOLO-World landmark detection.
 
-The algorithm and naming are synchronized to NavProbe commit `7e26999` (2026-09-18), while
-retaining this repository's robot interfaces. The original instruction remains
+The applicable algorithm and prompt contracts are synchronized through NavProbe
+commit `bfa2805` (2026-09-18), retaining this repository's robot interfaces. The original instruction remains
 available to the Executive and semantic skill selector. The waypoint grounder
 receives a self-contained selected skill and candidate evidence. Task updates
 use the native agenda/predicate protocol and commit atomically; an empty agenda
@@ -20,7 +20,9 @@ does not establish task completion.
 
 This repository does not import or require the sibling NavProbe repository.
 Future changes there do not change this installed agent. See
-[MIGRATION.md](MIGRATION.md) for the synchronization boundary and validation.
+[MIGRATION.md](MIGRATION.md) for the synchronization boundary and validation. The
+[2026-09-18 prompt usage report](docs/prompt-sync-20260918/PROMPT_USAGE_REPORT.md)
+records reproducible text character/token changes.
 
 It intentionally excludes Habitat/HM3D/R2R evaluation runners, experiment
 ablations, replay tools, batch launchers, web viewers, and raw prompt/response

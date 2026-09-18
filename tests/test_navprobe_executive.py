@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import itertools
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
@@ -162,6 +164,138 @@ class NavProbeExecutiveTests(unittest.TestCase):
             allow_retrieve=False, retrieve_completed_rounds=2, require_retrieval_conclusion=True)
         self.assertEqual(client.decide_vln_task_progress_step.call_count, 2)
 
+    def test_one_question_can_batch_complementary_turn_evidence(self):
+        payload = response(query="Did the executed turn pass the doorway before entering the corridor?")
+        items = [
+            {"ref": "n0", "fields": ["rgb"]},
+            {"ref": "e0", "fields": ["trajectory", "movement_rgb"]},
+            {"ref": "e1", "fields": ["trajectory"]},
+        ]
+        payload["tool_calls"][-1]["arguments"]["items"] = items
+        decision, client = assess(
+            agenda(objectives=["Turn after the doorway."]), [payload],
+            memory_index_text="n0: doorway; e0: incoming movement; e1: outgoing movement",
+            retrieve_fields_by_ref={item["ref"]: item["fields"] for item in items},
+        )
+        self.assertIsInstance(decision, RetrieveRequest)
+        self.assertEqual([(item.ref, list(item.fields)) for item in decision.items],
+                         [(item["ref"], item["fields"]) for item in items])
+        self.assertEqual(client.decide_vln_task_progress_step.call_count, 1)
+
+    def test_executive_mode_contracts_match_the_real_parser(self):
+        for allowed, pending, historical, terminal in itertools.product((False, True), repeat=4):
+            with self.subTest(allowed=allowed, pending=pending, historical=historical, terminal=terminal):
+                conclusion = "The stored doorway is the target opening." if pending else None
+                terminal_result = {"decision": "continue", "missing_constraints": ["The endpoint is unestablished."]} if terminal else None
+                memory = agenda(objectives=["Stop in the doorway."])
+                before = deepcopy(memory.to_dict())
+                decision, client = assess(
+                    memory, [response(conclusion=conclusion, terminal=terminal_result)],
+                    allow_retrieve=allowed, require_retrieval_conclusion=pending,
+                    retrieve_completed_rounds=0 if allowed else 2,
+                    planning_reference_panorama=historical,
+                    backtrack_context_text="Physical node: n2; planning reference: n1." if historical else "",
+                    terminal_check_context={"movement": "move", "stop_objective": "Stop in the doorway."} if terminal else None,
+                )
+                text = prompt_text(client.decide_vln_task_progress_step)
+                definitions = text.split("Tool definitions:\n", 1)[1].split("Response protocol:", 1)[0]
+                self.assertEqual("### `retrieve`" in definitions, allowed)
+                self.assertEqual("Additional argument: `terminal_check`" in definitions, terminal)
+                self.assertIn(f"zero to {3 if allowed else 2} calls", text)
+                self.assertEqual(decision.retrieval_conclusion, conclusion or "")
+                self.assertEqual(decision.terminal_check_decision, "continue" if terminal else "")
+                self.assertEqual(memory.to_dict(), before)
+                if not allowed:
+                    self.assertNotIn("If `retrieve` is present", text)
+                    self.assertIn("`retrieve` is unavailable for this call", text)
+                if historical:
+                    self.assertIn("execution starts from the physical robot pose", text)
+                    self.assertIn("a generated recovery objective is not independent evidence", text)
+
+                # Exercise the JSON example advertised inside the tool declaration,
+                # rather than only checking that a parameter name is mentioned.
+                agenda_definition = definitions.split("### `update_task_state`", 1)[1].split("### `retrieve`", 1)[0]
+                example = json.loads(agenda_definition.split("JSON:\n", 1)[1].strip())
+                payload = response(conclusion=conclusion)
+                payload["tool_calls"] = [example]
+                normalized = normalize_vln_task_progress_step(
+                    payload, retrieve_fields_by_ref={"n0": ["rgb"]},
+                    allow_retrieve=allowed, allow_update_progress=True,
+                    require_retrieval_conclusion=pending, require_terminal_check=terminal,
+                )
+                self.assertEqual(normalized.terminal_check_decision, "continue" if terminal else "")
+
+    def test_positive_budget_does_not_override_retrieval_eligibility(self):
+        decision, client = assess(
+            agenda(objectives=["Inspect doorway."]),
+            [response(query="Inspect n0?"), response()],
+            retrieve_max_rounds=6, retrieve_completed_rounds=0, allow_retrieve=False,
+        )
+        text = prompt_text(client.decide_vln_task_progress_step)
+        self.assertEqual(client.decide_vln_task_progress_step.call_count, 2)
+        self.assertIsInstance(decision, TaskProgressDecision)
+        self.assertIn("remaining rounds: 6", text)
+        self.assertIn("`retrieve` is unavailable for this call", text)
+        self.assertNotIn("### `retrieve`", text)
+
+    def test_skill_contracts_follow_anchor_availability_and_restrictions(self):
+        for anchors, required in ((set(), False), ({"n0"}, False), ({"n0"}, True)):
+            with self.subTest(anchors=anchors, required=required):
+                action = {"backtrack": {"subgoal_id": "sg0", "anchor_node_id": "n0", "objective": "Inspect the earlier branch.", "reason": "The junction supplies a useful view."}} if required else {"go_to_waypoint": {"subgoal_id": "sg0", "direction": "left", "reason": "Inspect the visible opening."}}
+                client = SimpleNamespace(decide_vln_navigation_step=Mock(return_value=action))
+                decision = decide_vln_navigation_step(
+                    client=client, cache=SimpleNamespace(),
+                    visual_context=VisualActionContext(current_node_id="n1", views=[]),
+                    task_progress=agenda(objectives=["Inspect the branch."]),
+                    latest_task_progress=TaskProgressDecision(progress_analysis="The branch remains unresolved.", progress_reasoning=""),
+                    retrieval_workspace_content=[], allowed_backtrack_node_ids=anchors,
+                    require_backtrack=required,
+                )
+                text = prompt_text(client.decide_vln_navigation_step)
+                self.assertEqual("### `backtrack`" in text, bool(anchors))
+                for name in ("go_to_waypoint", "approach_to_stop", "vertical_transition"):
+                    self.assertEqual(f"### `{name}`" in text, not required)
+                self.assertEqual(decision.action_mode, "backtrack" if required else "go_to_waypoint")
+
+    def test_stay_contract_distinguishes_physical_and_historical_references(self):
+        for historical, goal_kind in itertools.product((False, True), (GOAL_KIND_VLN_INSTRUCTION, GOAL_KIND_OBJECT_CATEGORY)):
+            with self.subTest(historical=historical, goal_kind=goal_kind):
+                payload = {"approach_to_stop": {"subgoal_id": "sg0", "movement": "stay", "stop_objective": "Stop in the supported final region.", "reason": "Use the supported stopping position."}}
+                client = SimpleNamespace(decide_vln_navigation_step=Mock(return_value=payload))
+                decision = decide_vln_navigation_step(
+                    client=client, cache=SimpleNamespace(), goal_kind=goal_kind,
+                    visual_context=VisualActionContext(current_node_id="n0", views=[]),
+                    task_progress=agenda(objectives=["Reach the final stopping region."]),
+                    latest_task_progress=TaskProgressDecision(progress_analysis="The reference shows the stopping region.", progress_reasoning=""),
+                    retrieval_workspace_content=[], planning_reference_panorama=historical,
+                    backtrack_context_text="Physical node: n2; planning reference: n0." if historical else "",
+                    system_owned_waypoint_objective=True,
+                )
+                text = prompt_text(client.decide_vln_navigation_step)
+                self.assertEqual(decision.approach_movement, "stay")
+                if historical:
+                    self.assertIn("`stay` requests physical navigation to the planning node", text)
+                    self.assertIn("execution starts from the physical robot pose", text)
+                    self.assertNotIn("`stay` only when the current pose is already", text)
+                else:
+                    self.assertIn("`stay` keeps the robot at its current pose without movement", text)
+                    self.assertNotIn("`stay` requests physical navigation", text)
+
+    def test_terminal_prompt_preserves_original_goal_over_a_stronger_helper(self):
+        goal = "Walk across the floor and wait at the archway."
+        memory = agenda(goal, ["Return to the exact historical n2 pose and wait there."])
+        _, client = assess(
+            memory, [response(terminal={"decision": "continue", "missing_constraints": ["The archway stopping relation needs evidence."]})],
+            allow_retrieve=False,
+            terminal_check_context={"movement": "move", "stop_objective": memory.items[0].content},
+        )
+        text = prompt_text(client.decide_vln_task_progress_step)
+        self.assertIn(goal, text)
+        self.assertIn(memory.items[0].content, text)
+        self.assertIn("generated helper objectives do not become additional original-task requirements", text)
+        self.assertIn("Distinct node IDs alone do not disprove arrival", text)
+        self.assertIn("at the actual physical endpoint", text)
+
     def test_negative_search_resolution_allows_continue_with_empty_agenda(self):
         memory = agenda("Find a chair.", ["Inspect the countertop region."])
         decision, _ = assess(memory, [response(
@@ -252,7 +386,7 @@ class NavProbeExecutiveTests(unittest.TestCase):
         self.assertIn("next decision step", prompt)
         self.assertIn("self-contained", prompt)
         self.assertIn("Semantic skill selection", prompt)
-        self.assertIn("The waypoint grounder receives this selected action", prompt)
+        self.assertIn("The waypoint grounder receives the selected action", prompt)
         for legacy in ("TPU", "PCNP", "task-progress", "Latest progress updates"):
             self.assertNotIn(legacy, prompt)
 

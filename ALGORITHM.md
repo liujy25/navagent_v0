@@ -1,7 +1,8 @@
 # NavProbe robot VLN algorithm
 
-This standalone implementation synchronizes the complete NavProbe VLN algorithm
-from `navagent-agent-mvp` commit `7e2699971dc854d8ed875a8c2cc8fe01f9518777`.
+This standalone implementation synchronizes the applicable NavProbe VLN algorithm
+and prompt contracts through `navagent-agent-mvp` commit
+`bfa2805b219bfe7e0e0f721ed9bb0a47f9049f61`.
 The Python package is `navprobe`; robot script filenames remain unchanged.
 The fixed configuration uses FSS, active entity-field retrieval, and entity
 knowledge consolidation. Simulation runners and experiment controls are excluded.
@@ -11,7 +12,10 @@ knowledge consolidation. Simulation runners and experiment controls are excluded
 The Initial Task Executive decomposes the original instruction into an initial
 `agenda`. Every objective starts active, with an empty result. The original
 instruction remains authoritative throughout navigation, including route order,
-spatial relations, and stopping partway up or down stairs.
+spatial relations, and stopping partway up or down stairs. Initialization preserves
+negation, ordinal references, before/after dependencies, and ambiguity for online
+interpretation. Generated helper objectives do not add requirements to the original
+task; historical node IDs alone do not prescribe exact stopping poses.
 
 Task state consists of a mutable agenda, evidence predicates, and execution
 history. Objectives have stable `subgoal_id` values and an `attempt` number.
@@ -50,7 +54,13 @@ The last batch must still be interpreted when the budget is exhausted, and the
 compact text index remains available.
 
 The default budget is six retrieval rounds per place step. Virtual Backtrack
-reference changes share that budget. A response without retrieval hands committed
+reference changes share that budget. Eligibility is stated separately from remaining
+budget. Retrieve for a decision-relevant gap that history could resolve, batching
+complementary records. Re-read only for a specific gap, lost detail, or contradiction.
+The budget is a ceiling; stop retrieving when action or fresh observation is needed,
+retaining uncertainty and interpreting any pending final batch.
+
+A response without retrieval hands committed
 task state, Executive assessment, conclusions, and spatial context to the skill
 selector. Retrieved raw images and update transaction logs are not forwarded as
 the selector's retrieval context. Text-only EKM consolidates retrieved conclusions
@@ -81,8 +91,15 @@ explanation for bounded semantic replanning.
 - **Backtrack:** switch to a stored planning reference and rerun the Executive and
   selector under the same budget. The switch itself does not move the robot or
   complete an objective. Grounded execution begins at the physical pose; graph
-  edges preserve both physical movement and the planning reference.
-- **Stop:** `approach_to_stop` first moves locally or stays. The next place step
+  edges preserve both physical movement and the planning reference. Returning to
+  the physical view or visiting the anchor is not required merely because the
+  reference changed. An anchor-grounded waypoint does not guarantee passage
+  through the anchor; any necessary physical revisit needs task/path evidence.
+- **Stop:** `approach_to_stop(move)` grounds a local approach. With a physical
+  reference, `stay` retains the physical pose. With a historical reference, `stay`
+  navigates to the planning node and records terminal `movement=move`; use it
+  only when intentionally returning to a supported final stopping position.
+  The next place step
   asks the Executive to verify the original task and terminal constraints.
   `continue` may formulate further objectives even with an empty agenda. `done`
   requires resolving remaining agenda entries and the original stopping conditions.

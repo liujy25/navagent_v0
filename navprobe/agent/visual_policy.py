@@ -58,7 +58,7 @@ Return only JSON matching the provided output contract.
 Original navigation instruction:
 {goal_text}
 
-Create initial route-level objectives in instruction order. Keep each required movement together with its defining landmarks and spatial relations. Preserve all stated stopping constraints, including stopping partway up or down a staircase; never replace a partial stair objective with a full-floor transition. Include only objectives supported by the instruction.
+Create initial route-level objectives in instruction order. Keep each required movement together with its defining landmarks and spatial relations, preserving negation, ordinal references, and before/after dependencies. Preserve all stated stopping constraints, including stopping partway up or down a staircase; never replace a partial stair objective with a full-floor transition. Include only objectives supported by the instruction; do not strengthen movement relations or add precision, centering, or facing requirements. Retain ambiguities that require observation for online interpretation.
 These initial objectives may later be refined, reprioritized, completed, abandoned, or reopened as evidence arrives. The original instruction and its ordering constraints remain authoritative. Evidence predicates are initially empty and are created online.
 
 Output contract:
@@ -129,7 +129,10 @@ _VLN_NAVIGATION_TOOLS = {
 }
 
 
-def _navprobe_executive_tool_schemas(*, allow_retrieve: bool, allow_update_progress: bool) -> list[str]:
+def _navprobe_executive_tool_schemas(
+    *, allow_retrieve: bool, allow_update_progress: bool,
+    require_terminal_check: bool = False,
+) -> list[str]:
     schemas = ["""### `update_predicates`
 Apply evidence-backed predicate changes to an active subgoal using its stable `subgoal_id`.
 Arguments: `predicate_updates`, a non-empty list of these operations:
@@ -141,6 +144,19 @@ Conditions on active objectives are applied before agenda operations. You may al
 JSON:
 {"name":"update_predicates","arguments":{"predicate_updates":[{"op":"add","subgoal_id":"sg0","content":"<supported proposition>","status":"confirmed"}]}}"""]
     if allow_update_progress:
+        terminal_argument = ""
+        agenda_example = '{"agenda_updates":[{"op":"complete","subgoal_id":"sg0","result":"<observed outcome>"}]}'
+        if require_terminal_check:
+            terminal_argument = """
+Additional argument: `terminal_check`, an object with exactly `decision` (done|continue) and `missing_constraints` (a list of original-task constraints).
+Use an empty list for done and a non-empty list for continue. Explain the decision in `task_state_assessment`, without a separate reason field.
+"""
+            terminal_argument += (
+                "When calling retrieve, omit terminal_check from the entire response. Otherwise, call update_task_state with terminal_check, even if agenda_updates is empty.\n"
+                if allow_retrieve else
+                "Call update_task_state with terminal_check in this response, even if agenda_updates is empty.\n"
+            )
+            agenda_example = '{"agenda_updates":[],"terminal_check":{"decision":"continue","missing_constraints":["<unmet or unestablished original-task constraint>"]}}'
         schemas.append("""### `update_task_state`
 Revise the agenda and preserve outcomes in execution history.
 Arguments: `agenda_updates`, a list of these operations; an empty list is allowed:
@@ -152,12 +168,11 @@ Arguments: `agenda_updates`, a list of these operations; an empty list is allowe
 - reopen: {"op":"reopen","subgoal_id":"sg0","position":0}
 Positions are zero-based pursuit priorities at the time of each operation; `reorder` lists every currently active ID exactly once. The system assigns new IDs on add. Complete and abandon remove the objective from the active agenda and archive this attempt with its evidence and spatial references. Reopen returns the same historical objective as a new attempt while retaining its previous outcome. Operations apply in list order as one validated transaction.
 All agenda entries, including instruction-initialized objectives, support these operations. The original goal, required route order, and stopping constraints remain authoritative. Abandoning or rewriting an objective does not remove a requirement of the original task.
-JSON:
-{"name":"update_task_state","arguments":{"agenda_updates":[{"op":"complete","subgoal_id":"sg0","result":"<observed outcome>"}]}}""")
+""" + terminal_argument + 'JSON:\n{"name":"update_task_state","arguments":' + agenda_example + '}')
     if allow_retrieve:
         schemas.append("""### `retrieve`
-Inspect historical evidence needed for one unresolved task-state question: whether to formulate a new objective, refine or reprioritize an objective, resolve it, or reconsider a historical outcome.
-Arguments: `query`, one focused question, and `items`, a non-empty list of entity refs and fields exposed by the memory index. Request the minimum sufficient available fields; exclude fields marked as provided.
+Inspect historical records that could resolve a concrete uncertainty affecting task state or the next action.
+Arguments: `query`, one decision-relevant question, and `items`, a non-empty list of entity refs and fields exposed by the memory index. Batch sufficient complementary fields for that question; exclude fields marked as provided.
 This is the last call in `tool_calls`; its evidence is interpreted in the next assessment. Updates in this response rely on evidence already in context.
 JSON:
 {"name":"retrieve","arguments":{"query":"<unresolved task-state question>","items":[{"ref":"<memory ref>","fields":["<available field>"]}]}}""")
@@ -167,6 +182,7 @@ JSON:
 def _navprobe_navigation_tool_schemas(
     *, allowed_backtrack_node_ids: set[str] | None, require_backtrack: bool,
     system_owned_waypoint_objective: bool,
+    planning_reference_panorama: bool = False,
 ) -> list[str]:
     schemas = ["""Action objective reference:
 For every action, set `subgoal_id` to the selected active objective's stable ID. When the agenda is empty, use JSON null and ground the action directly in the original task goal and its constraints. An empty agenda does not establish task completion. The examples with `<active ID>` use null in this case."""]
@@ -174,7 +190,7 @@ For every action, set `subgoal_id` to the selected active objective's stable ID.
 The waypoint grounder receives the selected action with candidate RGB/BEV overlays. Make the action self-contained: in `reason`, specify the immediate visible route or target region, the evidence that identifies it, and the relevant route-order, target-validity, or stopping constraint. Include any retrieved correction needed to interpret that region. Express these facts directly rather than referring to an agenda ID, predicate ID, assessment, or retrieval round for their meaning.""")
     if allowed_backtrack_node_ids:
         schemas.append("""### `backtrack`
-Switch the planning reference to one of the listed visited nodes to reconsider a missed route or search region. This action does not physically move the robot. The executive and skill policy rerun on the stored anchor observation; movement is executed from the physical pose only after subsequent grounding.
+Switch the planning reference to one of the listed visited nodes to reconsider a missed route or search region. This action does not physically move the robot. The executive and skill policy rerun on the stored anchor observation. Ground the next waypoint from that reference and execute from the physical pose; switching back to the physical view is not a prerequisite for movement. Select another reference when it adds relevant evidence or useful grounding options.
 Available anchors: """ + ", ".join(sorted(allowed_backtrack_node_ids)) + """
 JSON:
 {"backtrack":{"subgoal_id":"<active ID>","anchor_node_id":"<available anchor>","objective":"<relation or region to reassess>","reason":"<evidence supporting recovery>"}}""")
@@ -184,13 +200,18 @@ JSON:
         '"direction":"front|back|left|right"'
         if system_owned_waypoint_objective else '"objective":"<local navigation objective>"'
     )
+    stay_rule = (
+        "In this historical-reference mode, `stay` requests physical navigation to the planning node's position before terminal assessment; it does not keep the robot at its current physical pose. Use it only to intentionally return to a supported final stopping position at that node, not for ordinary recovery or an intermediate objective. The resulting terminal context records movement=move; the stored image does not prove arrival."
+        if planning_reference_panorama and system_owned_waypoint_objective else
+        "In this physical-reference mode, `stay` keeps the robot at its current pose without movement. Use it only when physical-pose evidence supports already occupying the final stopping region."
+    )
     schemas.extend([
         """### `go_to_waypoint`
 Advance the selected objective, or the original task when the agenda is empty, toward a visible route or region. Specify the immediate local target and its constraints in `reason`; the waypoint grounder selects an FSS candidate for that target. Interpret direction in the current observation's frame.
 JSON:
 {"go_to_waypoint":{"subgoal_id":"<active ID>",""" + waypoint_field + """, "reason":"<visible route and why it advances this objective>"}}""",
         """### `approach_to_stop`
-Propose final local positioning toward the original task's stopping region. Use `move` for a reachable local approach and `stay` when the observed pose already occupies that region. The Task Executive verifies the original task and terminal constraints at the next decision step before declaring completion.
+Propose final local positioning toward the original task's stopping region. Use `move` to ground a reachable local approach. """ + stay_rule + """ The Task Executive verifies the original task and terminal constraints at the next decision step before declaring completion. Preserve the original stopping relation without adding an exact historical pose, centering, or facing requirement.
 Use the selected active subgoal ID, or null only if the agenda is empty. The examples show the empty-agenda case; replace null with the selected ID when an objective remains. Visibility at a distance does not establish arrival.
 JSON for stay:
 {"approach_to_stop":{"subgoal_id":null,"movement":"stay","stop_objective":"<original task's stopping relation>","reason":"<endpoint evidence>"}}
@@ -218,14 +239,21 @@ ObjectNav progress rules:
 """.strip()
 
 
-def _object_navigation_action_rules(*, goal_kind: str) -> str:
+def _object_navigation_action_rules(
+    *, goal_kind: str, planning_reference_panorama: bool = False,
+) -> str:
     if str(goal_kind).strip() != GOAL_KIND_OBJECT_CATEGORY:
         return ""
-    return """
+    stay_rule = (
+        "Use `approach_to_stop` with `stay` only to intentionally return to a planning node supported as near-target reachable floor; verify actual arrival after execution."
+        if planning_reference_panorama else
+        "Use `approach_to_stop` with `stay` only when the current pose is already on that near-target reachable floor; image proximity alone is insufficient."
+    )
+    return f"""
 ObjectNav action rules:
 - Use `go_to_waypoint` to keep searching when a target is only visible at a distance or has no visibly connected reachable approach.
 - Use `approach_to_stop` with `move` only when the objective is reachable floor adjacent to the target in the same accessible local region.
-- Use `approach_to_stop` with `stay` only when the current pose is already on that near-target reachable floor; image proximity alone is insufficient.
+- {stay_rule}
 - Never approach or stop for an exterior target seen through glass or a window, or for a target separated by a mirror, closed door, enclosure, height difference, or disconnected free space.
 """.strip()
 
@@ -408,9 +436,11 @@ def _run_vln_task_module_prompt(
             allowed_backtrack_node_ids=allowed_backtrack_node_ids,
             require_backtrack=require_backtrack,
             system_owned_waypoint_objective=system_owned_waypoint_objective,
+            planning_reference_panorama=planning_reference_panorama,
         )
         if allow_navigation_actions else _navprobe_executive_tool_schemas(
             allow_retrieve=allow_retrieve, allow_update_progress=allow_update_progress,
+            require_terminal_check=terminal_check_required,
         )
     )
     retrieve_remaining = max(
@@ -439,6 +469,7 @@ Retrieval budget for this navigation step:
 - maximum rounds: {int(retrieve_max_rounds)}
 - completed rounds: {int(retrieve_completed_rounds)}
 - remaining rounds: {int(retrieve_remaining)}
+- `retrieve` is {"available" if allow_retrieve else "unavailable"} for this call; remaining budget alone does not grant tool access.
 {single_retrieval_instruction}
 """.rstrip()
         retrieval_semantics = """
@@ -514,51 +545,36 @@ Latest unresolved retrieval round:
     )
     task_progress_semantics = """
 Task-state semantics:
-- The original task goal, route-order requirements, and stopping constraints remain authoritative throughout navigation.
-- The agenda is an ordered list of current intermediate objectives, each with a stable subgoal ID and execution attempt. Its content, size, and pursuit priority can change, including objectives initialized from the instruction.
-- Formulate new objectives from observations and retrieved evidence; refine descriptions, change pursuit priorities, complete successful objectives, abandon attempts that are no longer useful, and reopen historical objectives when evidence warrants reconsideration.
-- Pursuit priority may change during recovery; it does not change the original instruction's required route order. Abandoning an agenda objective does not satisfy or erase an original requirement.
-- History retains completed and abandoned attempts, their execution summaries, predicates, and spatial references. Reopening preserves the earlier outcome.
-- For ObjectNav, construct search objectives online, such as inspecting a candidate region, exploring a likely room, or revisiting a promising observation. A completed inspection may have a negative outcome, such as no target found. That does not complete the object-finding task.
-- Predicate sets are initially empty, dynamic, and non-exhaustive. A predicate is an evidence-checkable proposition relevant to pursuing or resolving its objective. `confirmed` means the evidence establishes it; `unconfirmed` means it has not been established, not that it is false.
-- Resolve each objective from its full semantics and available evidence, not by counting confirmed predicates. Revise invalid or irrelevant predicates as the objective and evidence change.
-- An empty agenda does not establish the original task's completion. Introduce a supported next objective when work remains, or retain uncertainty when evidence is insufficient.
-- The system records execution identities and spatial spans; objective and predicate text describe task semantics.
-""".strip()
-    progress_workflow = """
-Workflow:
-1. If newly retrieved evidence is attached, answer its query in `retrieval_conclusion`, identifying supporting or contradicting refs and what remains unresolved.
-2. Compare the original goal and ordering constraints with the observation, active agenda, execution history, entity knowledge, and evidence conclusions.
-3. Decide which objectives to formulate, refine, reprioritize, resolve, or reopen, and which verification predicates to revise.
-4. Formulate a focused question when historical evidence could change that task-state decision. Use the index to select the relevant entity fields when a retrieval round is available.
-5. Write `task_state_assessment` explaining the assessment, proposed updates, and any remaining question. Output the corresponding tools, using only evidence already available.
-6. When no further retrieval is needed or the budget is exhausted, finalize the supported state while retaining unresolved facts. Always interpret the final evidence batch before handoff.
+- The original goal defines movement, route order, and stopping requirements. The agenda is a revisable plan; generated helper objectives do not become additional original-task requirements. Preserve the original relations without adding passage, proximity, centering, or facing requirements.
+- Revise only state that needs revision. Pursuit priority does not change the original instruction's required route order. Resolve objectives from their full meaning and evidence, not by counting confirmed predicates. An empty agenda or a negative search does not establish overall completion; formulate a supported next objective when work remains.
+- Predicates are initially empty, dynamic, and non-exhaustive. `confirmed` records an evidence-supported claim that can be corrected; `unconfirmed` means unestablished, not false. Revise invalid or irrelevant predicates as needed.
+- Use grounded hypotheses to choose useful investigation while preserving uncertainty. A negative search may resolve an inspection objective. Hypotheses, detector labels, requested actions, and visibility alone do not establish task completion; movement relations require spatial boundaries and execution evidence.
+- Distinguish past execution events from current-position relations. Later movement does not erase a supported past event; contradictory evidence can change its interpretation. Historical nodes are spatial references, not exact required stopping poses unless the original task requires them. Different node IDs alone do not disprove arrival.
 """.strip()
     evidence_retrieval_policy = """
 Evidence and retrieval policy:
-- Distinguish seeing a target from executing a required movement, passage, turn, entry, approach, or stopping relation. Use spatial boundaries and execution evidence to determine room membership.
-- The compact entity index summarizes prior knowledge and exposes records for inspection. Retrieve when a concrete unresolved question could change objective generation, priority, interpretation, resolution, or a historical judgment.
-- Each query asks one focused task-state question and selects the minimum sufficient entity fields. Further queries address the remaining gap using earlier conclusions and references.
-- A request is not evidence. Updates sent with a retrieval request use only evidence already available; interpret returned fields in the following assessment.
-- At the budget limit, conclude the latest batch, commit the evidence-supported state, and retain uncertainty where evidence is missing.
+- Use sufficient current evidence directly. Retrieve for an uncertainty that historical records could resolve and whose answer could change task interpretation, progress, or action. Batch complementary records; further rounds need a decision-relevant gap.
+- Conclusions remain usable when earlier raw evidence is no longer attached. Re-read for a specific gap, lost detail, or contradiction, not merely an absent image.
+- The budget is a limit, not a quota. End retrieval when the next decision is supported or remaining uncertainty needs movement or a fresh observation; state that need and retain uncertainty. History cannot verify a future endpoint, and ending retrieval does not establish completion.
+- A request is not evidence. Updates use evidence already supplied. Conclude every pending batch before handoff, even at zero budget; leave missing evidence unconfirmed.
 """.strip()
     navigation_state_semantics = """
 Task-state semantics:
-- Use the original goal and its route-order and stopping constraints, the executive's committed active agenda, and its preserved execution history.
-- Choose an active subgoal by stable `subgoal_id`; agenda order expresses current pursuit priority. When the agenda is empty, use `subgoal_id=null` and ground the action directly in the original task and its constraints. Overall completion is decided by the next executive terminal assessment.
-- Use the latest executive analysis and retrieval conclusions to interpret the evidence. Confirmed predicates are established facts; unconfirmed predicates remain unresolved. Negative search outcomes guide further search and do not establish the overall goal.
+- Interpret committed state using the original goal, route order, and stopping relation; helper objectives and historical nodes cannot strengthen them. Agenda order is pursuit priority.
+- Use the Executive assessment and evidence conclusions. Carry contradictions and material uncertainty in `reason` without rewriting state. Confirmed predicates can be corrected; unconfirmed means unknown, not false. An empty agenda or negative search does not establish completion; the Executive assesses completion.
 """.strip()
     navigation_action_rules = ""
     if allow_navigation_actions:
         navigation_action_rules = """
 Semantic skill selection:
-1. Use the original goal, current task state, and the Task Executive's assessment to choose the objective to pursue.
-2. Identify its immediate visible route or target region using the current panorama, relevant evidence conclusions, and spatial context. Preserve the original route order and endpoint constraints.
-3. Select one skill and state its parameters in the current observation's reference frame.
-4. Write a self-contained `reason` naming the local route or region, the evidence that identifies it, and the constraints needed to ground this action. Carry forward relevant corrected landmark identities and unresolved facts. The waypoint grounder receives this selected action, so express the needed facts directly.
-- After rejected grounding, revise the local target using the reported candidate evidence and the original task constraints.
+Choose one available skill to advance the task or inspect a grounded hypothesis. An intermediate visible route or inspection region is useful even when its destination is unknown; preserve required turns, passages, and stopping boundaries without inventing unseen contents. Express the local intent in the panorama's reference frame with a concise, self-contained reason as specified below. Use grounding rejection feedback to revise the local target.
 """.strip()
-        object_action_rules = _object_navigation_action_rules(goal_kind=goal_kind)
+        object_action_rules = _object_navigation_action_rules(
+            goal_kind=goal_kind,
+            planning_reference_panorama=(
+                planning_reference_panorama and system_owned_waypoint_objective
+            ),
+        )
         if object_action_rules:
             navigation_action_rules += "\n\n" + object_action_rules
     node_binding_rule = (
@@ -577,20 +593,25 @@ Semantic skill selection:
             if approach_movement == "stay"
             else "The latest `approach_to_stop` movement reached the current pose."
         )
+        terminal_call_rule = (
+            "If this response calls `retrieve`, omit `terminal_check` until the returned evidence has been assessed. Otherwise, call `update_task_state` with `terminal_check`, even when `agenda_updates` is empty."
+            if allow_retrieve else
+            "Call `update_task_state` with `terminal_check` in this response, even when `agenda_updates` is empty."
+        )
         terminal_check_section = f"""
 
 Post-approach terminal check:
 - {approach_result}
-- Reassess the ordered task and final stopping constraints at this endpoint.
-- `done` requires evidence that the original goal and all required route-order and stopping constraints are satisfied. Resolve or abandon any remaining intermediate objectives in this transaction.
-- `continue` names the missing original-task constraints, including when the agenda is empty. Add a supported objective if further pursuit is clear.
+- Judge the final stopping relation at the actual physical endpoint and required route events from supported execution history. The approach objective is a proposed plan, not an additional task requirement.
+- `done` requires evidence that the original goal and all required route-order and stopping constraints are satisfied. Complete supported objectives and abandon only obsolete helper objectives in this transaction; abandonment does not satisfy an original requirement.
+- `continue` names the unmet or unestablished original-task constraints, including when the agenda is empty. Distinguish a known violation from missing evidence; add a supported objective if further pursuit is clear.
+- Do not require exact reproduction of a historical pose, centering, orientation, or extra proximity unless the original task requires it. Distinct node IDs alone do not disprove arrival; assess the physical stopping relation.
 - Agenda exhaustion and completion of a negative search are insufficient for `done`.
-- If this response calls `retrieve`, defer `terminal_check` until the retrieved evidence has been assessed.
-- Otherwise, call `update_task_state` with `terminal_check`, even when `agenda_updates` is empty.
+- {terminal_call_rule}
 - Explain the terminal decision in `task_state_assessment` using the current endpoint evidence and final stopping requirements. Return `decision` and `missing_constraints` in `terminal_check`, without a separate `reason`.
 {_object_navigation_terminal_rules(goal_kind=goal_kind)}
 
-Approach objective:
+Proposed approach objective (interpret against the original task):
 {stop_objective}
 """.rstrip()
     system_prompt = (
@@ -617,7 +638,7 @@ Approach objective:
             "<direct answer to the latest retrieval query, supporting refs, and unresolved evidence>"
         )
     response_example["task_state_assessment"] = (
-        "<overall progress assessment, required updates, and any remaining evidence need>"
+        "<supported progress, required updates, and any decision-relevant gap or needed action/observation>"
     )
     response_example["tool_calls"] = []
     conclusion_protocol = (
@@ -654,15 +675,26 @@ Approach objective:
             retrieval_example["tool_calls"] = [
                 {"name": "update_task_state", "arguments": {"agenda_updates": []}},
                 {"name": "retrieve", "arguments": {
-                    "query": "<unresolved endpoint verification question>",
+                    "query": "<decision-relevant question answerable from historical records>",
                     "items": [{"ref": "<retrievable ref>", "fields": ["<available field>"]}],
                 }},
             ]
             response_examples = (
-                "Continue verification: optionally update progress, then call retrieve. "
+                "If historical records could resolve the remaining question, optionally update progress, then call retrieve. "
                 "Omit terminal_check from this entire response; assess the endpoint after the evidence returns.\n"
                 + json.dumps(retrieval_example) + "\n\n" + response_examples
             )
+    executive_tool_order = ["`update_predicates`"]
+    if allow_update_progress:
+        executive_tool_order.append("`update_task_state`")
+    if allow_retrieve:
+        executive_tool_order.append("`retrieve`")
+    retrieval_call_protocol = (
+        "- If `retrieve` is present, the system applies the updates, loads the requested evidence, and calls Task Executive again.\n"
+        "- If `retrieve` is absent, Task Executive reasoning ends after the updates are applied.\n"
+        if allow_retrieve else
+        "- `retrieve` is unavailable for this call. Interpret any pending evidence before handing off; Task Executive reasoning ends after the supported updates and any required terminal check.\n"
+    )
     response_protocol = (
         (
             "Action contracts:\n\n" + "\n\n".join(tool_schemas)
@@ -674,14 +706,13 @@ Approach objective:
             + "\n\nResponse protocol:\n"
             + "- Include a non-empty `task_state_assessment` in every response, including when `tool_calls` is empty.\n"
             + conclusion_protocol
-            + "- `task_state_assessment` explains how the current observations, stored knowledge, and retrieval conclusions affect overall task progress and any further evidence need.\n"
+            + "- `task_state_assessment` is a concise evidence summary of progress, updates, and the next objective or material uncertainty, including any needed action or observation; no step-by-step reasoning transcript is required.\n"
             + "- Put the reasons for item updates and condition operations in `task_state_assessment`. Their tool arguments specify the changes without separate `reason` fields.\n"
-            + "- `tool_calls` contains zero to three calls. Use each available tool at most once.\n"
-            + "- Order calls as `update_predicates`, `update_task_state`, then `retrieve`. Omit calls that are not needed.\n"
+            + f"- `tool_calls` contains zero to {len(executive_tool_order)} calls. Use each available tool at most once.\n"
+            + "- Order calls as " + ", ".join(executive_tool_order) + ". Omit calls that are not needed.\n"
             + "- `update_predicates` must contain at least one operation.\n"
             + "- When no update, retrieval, or terminal check is needed, return `tool_calls: []`.\n"
-            + "- If `retrieve` is present, the system applies the updates, loads the requested evidence, and calls Task Executive again.\n"
-            + "- If `retrieve` is absent, Task Executive reasoning ends after the updates are applied.\n"
+            + retrieval_call_protocol
             + "- Include no other top-level fields.\n\n"
             + response_examples
         )
@@ -700,7 +731,6 @@ Approach objective:
                 else ""
             ),
             conclusion_rules,
-            progress_workflow if allow_retrieve or allow_update_progress else "",
             navigation_action_rules,
             response_protocol,
         )
@@ -730,7 +760,10 @@ Approach objective:
         )
         observation_reference_lines.append(
             "The physical robot remains at the physical node stated in the backtrack context. "
-            "Use this stored panorama to reassess that place and the recorded route. "
+            "Use this stored panorama to reassess the route and ground the next waypoint; execution starts from the physical robot pose. "
+            "There is no need to switch back to the physical view or physically return to the anchor solely because the reference changed. "
+            "A required physical revisit must be supported by the original route, actual path constraints, or necessary new observations; a generated recovery objective is not independent evidence for it. "
+            "Selecting an anchor-grounded waypoint does not guarantee passage through the anchor. "
             "A planning-reference switch supplies no new execution evidence: arrival, entry, "
             "passage, approach, and stopping judgments must be grounded in actual observations "
             "and executed trajectories. The BEV reference marker identifies the planning anchor."

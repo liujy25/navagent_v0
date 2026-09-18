@@ -83,6 +83,19 @@ class NavProbeRuntimeTests(unittest.TestCase):
             goal_text=self.goal_text, visual_context=self.context, vln_landmark_context=None,
         )
 
+    def test_first_step_keeps_positive_budget_without_offering_retrieve_or_backtrack(self):
+        self.step.place_step_index = 0
+        self.state.max_retrieve_rounds = 6
+        self.client.decide_vln_task_progress_step.return_value = executive_response()
+        result = self.run_loop()
+        prompt = str(self.client.decide_vln_task_progress_step.call_args.args[1])
+        self.assertIn("remaining rounds: 6", prompt)
+        self.assertIn("`retrieve` is unavailable for this call", prompt)
+        self.assertNotIn("### `retrieve`", prompt)
+        self.assertEqual(result.workspace.retrieve_count, 0)
+        self.assertEqual(self.policy.call_args.kwargs["allowed_backtrack_node_ids"], set())
+        self.materialize.assert_not_called()
+
     def test_object_search_activates_empty_agenda_and_passes_original_goal_to_policy(self):
         self.goal_text = "Find a mug."
         self.memory = TaskProgressMemory()
@@ -135,6 +148,35 @@ class NavProbeRuntimeTests(unittest.TestCase):
         self.assertTrue(all(not item.start_node_id for item in self.memory.items))
         with self.assertRaisesRegex(ValueError, "inactive subgoal"):
             _bind_navigation_subgoal(navigation(subgoal_id="missing"), self.memory)
+
+    def test_terminal_retrieval_can_end_with_budget_remaining_and_uncertainty_for_action(self):
+        self.state.max_retrieve_rounds = 6
+        self.state.pending_vln_terminal_check = {"movement": "move", "stop_objective": "Stop beside the table."}
+        missing = "The physical endpoint beside the table remains unestablished."
+        conclusion = "e0 identifies the kitchen doorway; it cannot establish the next approach endpoint."
+        assessment = "Approach the table and assess the endpoint from a fresh physical observation."
+        final = executive_response(
+            conditions=[{"op": "add", "subgoal_id": "sg1", "content": "The robot is beside the table.", "status": "unconfirmed"}],
+            conclusion=conclusion,
+            terminal={"decision": "continue", "missing_constraints": [missing]},
+        )
+        final["task_state_assessment"] = assessment
+        self.client.decide_vln_task_progress_step.side_effect = [executive_response(retrieve=True), final]
+        result = self.run_loop()
+        self.assertEqual(result.workspace.retrieve_count, 1)
+        self.assertTrue(result.workspace.can_retrieve)
+        self.assertFalse(result.workspace.has_pending_evidence)
+        self.assertEqual(self.materialize.call_count, 1)
+        self.assertEqual(self.client.decide_vln_task_progress_step.call_count, 2)
+        self.assertEqual(self.memory.items[1].conditions[0].status, "unconfirmed")
+        self.assertEqual(result.task_progress_decision.terminal_check_decision, "continue")
+        self.assertIsNone(self.state.pending_vln_terminal_check)
+        self.policy.assert_called_once()
+        handoff = self.policy.call_args.kwargs
+        self.assertEqual(handoff["latest_task_progress"].progress_analysis, assessment)
+        self.assertEqual(handoff["latest_task_progress"].terminal_check_missing_constraints, [missing])
+        self.assertIn(conclusion, str(handoff["retrieval_workspace_content"]))
+        self.assertNotIn("Historical doorway movement evidence.", str(handoff["retrieval_workspace_content"]))
 
     def test_physical_execution_starts_selected_attempt_and_records_stable_binding(self):
         selected = _bind_navigation_subgoal(navigation(subgoal_id="sg1"), self.memory)

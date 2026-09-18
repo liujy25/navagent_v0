@@ -334,7 +334,7 @@ class StopFssExecutionTest(unittest.TestCase):
         self.assertEqual(action.args["decision_type"], "approach_to_stop")
 
     @patch("navprobe.agent.visual_step_execution.set_pending_node_move")
-    def test_backtracked_vln_stop_approach_defers_to_terminal_progress_check(
+    def test_backtracked_stay_movement_defers_to_terminal_progress_check(
         self,
         set_pending_node_move,
     ) -> None:
@@ -393,7 +393,14 @@ class StopFssExecutionTest(unittest.TestCase):
             action=action,
             action_call=ActionCall(action="goto", args={"x": 1.0, "y": 0.0}),
             decision_payload={
-                "navigation_mode": _stop_navigation_mode().to_dict(),
+                "navigation_mode": NavigationModeDecision(
+                    action_mode="approach_to_stop",
+                    approach_movement="stay",
+                    stop_objective="Stop at the instruction endpoint.",
+                    progress_analysis="The anchor is the stopping position.",
+                    progress_reasoning="Return before assessing completion.",
+                    reasoning_action="Return to the supported stopping position.",
+                ).to_dict(),
                 "backtrack_contexts": [
                     {
                         "anchor_node_id": "n1",
@@ -409,6 +416,7 @@ class StopFssExecutionTest(unittest.TestCase):
         self.assertEqual(step.executed_action["type"], "move_to_visual_waypoint")
         self.assertIsNone(state.stop_result)
         self.assertEqual(state.finalize_reason, "")
+        self.assertEqual(state.pending_vln_terminal_check["movement"], "move")
         self.assertEqual(
             state.pending_vln_terminal_check["stop_objective"],
             "Stop at the instruction endpoint.",
