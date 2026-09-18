@@ -1,7 +1,7 @@
 from copy import deepcopy
 import unittest
 
-from navclaw.memory.task_progress import TaskProgressItem, TaskProgressMemory
+from navprobe.memory.task_progress import TaskProgressItem, TaskProgressMemory
 
 
 class NavProbeAgendaTests(unittest.TestCase):

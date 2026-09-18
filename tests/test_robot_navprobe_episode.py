@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from navclaw.agent import vln_runner
-from navclaw.config.vln_runtime import VlnRuntimeConfig
-from navclaw.env.robot_rpc_env import RobotRPCEnv
-from navclaw.env.rpc_protocol import encode_array, encode_depth_meters, encode_rgb_image
-from navclaw.llm.client import LLMClient
+from navprobe.agent import vln_runner
+from navprobe.config.vln_runtime import VlnRuntimeConfig
+from navprobe.env.robot_rpc_env import RobotRPCEnv
+from navprobe.env.rpc_protocol import encode_array, encode_depth_meters, encode_rgb_image
+from navprobe.llm.client import LLMClient
 
 
 class RobotService:
@@ -67,8 +67,8 @@ class RobotService:
 @pytest.fixture
 def robot(monkeypatch):
     service = RobotService()
-    monkeypatch.setattr('navclaw.env.robot_rpc_env.requests.get', service.request)
-    monkeypatch.setattr('navclaw.env.robot_rpc_env.requests.post', service.request)
+    monkeypatch.setattr('navprobe.env.robot_rpc_env.requests.get', service.request)
+    monkeypatch.setattr('navprobe.env.robot_rpc_env.requests.post', service.request)
     monkeypatch.setattr(vln_runner, 'YOLOWorldLocalDetector', lambda **kwargs: SimpleNamespace())
     original = VlnRuntimeConfig.global_bev_kwargs
     monkeypatch.setattr(VlnRuntimeConfig, 'global_bev_kwargs', lambda self: {**original(self), 'size': 240})

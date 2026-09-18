@@ -5,19 +5,19 @@ import unittest
 from unittest.mock import patch
 
 
-from navclaw.agent.actions import AgentAction
-from navclaw.agent.actions import AgentActionType
-from navclaw.agent.visual_action_context import VisualActionContext
-from navclaw.agent.visual_navigation import VisualNavigationDecision
-from navclaw.agent.visual_policy_decisions import LocalMovePlanDecision
-from navclaw.agent.visual_policy_decisions import NavigationModeDecision
-from navclaw.agent.visual_step_execution import _execute_visual_action_call
-from navclaw.agent.visual_step_execution import run_visual_waypoint_decision
-from navclaw.agent.waypoint import GroundedWaypointTarget
-from navclaw.memory.task_progress import TaskProgressMemory, TaskProgressUpdateResult
-from navclaw.perception.goal_identity import GOAL_KIND_VLN_INSTRUCTION
-from navclaw.schemas import ActionCall
-from navclaw.schemas import ActionResult
+from navprobe.agent.actions import AgentAction
+from navprobe.agent.actions import AgentActionType
+from navprobe.agent.visual_action_context import VisualActionContext
+from navprobe.agent.visual_navigation import VisualNavigationDecision
+from navprobe.agent.visual_policy_decisions import LocalMovePlanDecision
+from navprobe.agent.visual_policy_decisions import NavigationModeDecision
+from navprobe.agent.visual_step_execution import _execute_visual_action_call
+from navprobe.agent.visual_step_execution import run_visual_waypoint_decision
+from navprobe.agent.waypoint import GroundedWaypointTarget
+from navprobe.memory.task_progress import TaskProgressMemory, TaskProgressUpdateResult
+from navprobe.perception.goal_identity import GOAL_KIND_VLN_INSTRUCTION
+from navprobe.schemas import ActionCall
+from navprobe.schemas import ActionResult
 
 
 def _stop_navigation_mode() -> NavigationModeDecision:
@@ -61,7 +61,7 @@ def _step() -> SimpleNamespace:
 
 
 class StopFssExecutionTest(unittest.TestCase):
-    @patch("navclaw.agent.visual_step_execution.plan_visual_navigation_action")
+    @patch("navprobe.agent.visual_step_execution.plan_visual_navigation_action")
     def test_vln_stop_stay_reuses_current_node_without_movement(
         self,
         plan_visual_navigation_action,
@@ -115,9 +115,9 @@ class StopFssExecutionTest(unittest.TestCase):
         )
         self.assertEqual(state.finalize_reason, "")
 
-    @patch("navclaw.agent.visual_step_execution.apply_agent_feedback")
-    @patch("navclaw.agent.visual_step_execution._execute_visual_action_call")
-    @patch("navclaw.agent.visual_step_execution.plan_visual_navigation_action")
+    @patch("navprobe.agent.visual_step_execution.apply_agent_feedback")
+    @patch("navprobe.agent.visual_step_execution._execute_visual_action_call")
+    @patch("navprobe.agent.visual_step_execution.plan_visual_navigation_action")
     def test_backtracked_stay_executes_return_to_planning_node(
         self,
         plan_visual_navigation_action,
@@ -174,9 +174,9 @@ class StopFssExecutionTest(unittest.TestCase):
         self.assertTrue(action.args["stop_approach"])
         self.assertEqual(action.args["decision_type"], "approach_to_stop")
 
-    @patch("navclaw.agent.visual_step_execution.apply_agent_feedback")
-    @patch("navclaw.agent.visual_step_execution.execute_vertical_transition_action")
-    @patch("navclaw.agent.visual_step_execution.plan_visual_navigation_action")
+    @patch("navprobe.agent.visual_step_execution.apply_agent_feedback")
+    @patch("navprobe.agent.visual_step_execution.execute_vertical_transition_action")
+    @patch("navprobe.agent.visual_step_execution.plan_visual_navigation_action")
     def test_vertical_transition_forwards_backtrack_planning_context(
         self,
         plan_visual_navigation_action,
@@ -228,7 +228,7 @@ class StopFssExecutionTest(unittest.TestCase):
         self.assertEqual(action.args["planning_node_id"], "n1")
         self.assertEqual(action.args["backtrack_contexts"], backtrack_contexts)
 
-    @patch("navclaw.agent.visual_step_execution.set_pending_node_move")
+    @patch("navprobe.agent.visual_step_execution.set_pending_node_move")
     def test_backtrack_execution_preserves_reference_in_pending_move(
         self,
         set_pending_node_move,
@@ -286,9 +286,9 @@ class StopFssExecutionTest(unittest.TestCase):
             "n1",
         )
 
-    @patch("navclaw.agent.visual_step_execution.apply_agent_feedback")
-    @patch("navclaw.agent.visual_step_execution._execute_visual_action_call")
-    @patch("navclaw.agent.visual_step_execution.plan_visual_navigation_action")
+    @patch("navprobe.agent.visual_step_execution.apply_agent_feedback")
+    @patch("navprobe.agent.visual_step_execution._execute_visual_action_call")
+    @patch("navprobe.agent.visual_step_execution.plan_visual_navigation_action")
     def test_grounded_stop_candidate_is_executed_as_stop_approach(
         self,
         plan_visual_navigation_action,
@@ -333,7 +333,7 @@ class StopFssExecutionTest(unittest.TestCase):
         self.assertTrue(action.args["stop_approach"])
         self.assertEqual(action.args["decision_type"], "approach_to_stop")
 
-    @patch("navclaw.agent.visual_step_execution.set_pending_node_move")
+    @patch("navprobe.agent.visual_step_execution.set_pending_node_move")
     def test_backtracked_vln_stop_approach_defers_to_terminal_progress_check(
         self,
         set_pending_node_move,
@@ -421,8 +421,8 @@ class StopFssExecutionTest(unittest.TestCase):
 
 
 
-    @patch("navclaw.agent.visual_step_execution.apply_agent_feedback")
-    @patch("navclaw.agent.visual_step_execution.plan_visual_navigation_action")
+    @patch("navprobe.agent.visual_step_execution.apply_agent_feedback")
+    @patch("navprobe.agent.visual_step_execution.plan_visual_navigation_action")
     def test_progress_terminal_done_executes_without_navigation_action(
         self,
         plan_visual_navigation_action,

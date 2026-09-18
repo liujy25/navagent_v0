@@ -1,8 +1,8 @@
 # NavProbe robot VLN algorithm
 
 This standalone implementation synchronizes the complete NavProbe VLN algorithm
-from `navagent-agent-mvp` commit `f26d5a108876cdbe47023879cd5cf31ac92cd197`.
-The Python package remains named `navclaw` so existing robot launch commands work.
+from `navagent-agent-mvp` commit `7e2699971dc854d8ed875a8c2cc8fe01f9518777`.
+The Python package is `navprobe`; robot script filenames remain unchanged.
 The fixed configuration uses FSS, active entity-field retrieval, and entity
 knowledge consolidation. Simulation runners and experiment controls are excluded.
 

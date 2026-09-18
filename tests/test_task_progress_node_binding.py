@@ -3,12 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from navclaw.agent.visual_action_context import VisualActionContext
-from navclaw.agent.visual_navigation import _current_active_task_progress_item
-from navclaw.agent.visual_policy import ensure_task_progress_memory
-from navclaw.memory.task_progress import TaskProgressItem
-from navclaw.memory.task_progress import TaskProgressCondition
-from navclaw.memory.task_progress import TaskProgressMemory
+from navprobe.agent.visual_action_context import VisualActionContext
+from navprobe.agent.visual_navigation import _current_active_task_progress_item
+from navprobe.agent.visual_policy import ensure_task_progress_memory
+from navprobe.memory.task_progress import TaskProgressItem
+from navprobe.memory.task_progress import TaskProgressCondition
+from navprobe.memory.task_progress import TaskProgressMemory
 
 
 def _agenda(items: list[TaskProgressItem]) -> TaskProgressMemory:

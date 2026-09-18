@@ -5,17 +5,17 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from navclaw.agent import visual_navigation
-from navclaw.agent.episodic_retrieval import RetrievalWorkspace
-from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext
-from navclaw.agent.visual_navigation import _vln_waypoint_inherited_agent_context
-from navclaw.agent.visual_policy_decisions import NavigationModeDecision, TaskProgressDecision
-from navclaw.agent.vln_waypoint_policy import _selected_sampled_candidate, _VlnViewCandidateSet, plan_vln_waypoint_loop
-from navclaw.agent.vln_waypoint_sampling import VlnSampledWaypointCandidate
-from navclaw.agent.waypoint.types import GroundedWaypointTarget, WaypointPolicyOutput, WaypointPolicyResult
-from navclaw.graph.graph import Graph
-from navclaw.memory.task_progress import TaskProgressItem, TaskProgressMemory, TaskProgressUpdateResult
-from navclaw.perception.goal_identity import GOAL_KIND_VLN_INSTRUCTION
+from navprobe.agent import visual_navigation
+from navprobe.agent.episodic_retrieval import RetrievalWorkspace
+from navprobe.agent.visual_action_context import VisualActionContext, VisualViewContext
+from navprobe.agent.visual_navigation import _vln_waypoint_inherited_agent_context
+from navprobe.agent.visual_policy_decisions import NavigationModeDecision, TaskProgressDecision
+from navprobe.agent.vln_waypoint_policy import _selected_sampled_candidate, _VlnViewCandidateSet, plan_vln_waypoint_loop
+from navprobe.agent.vln_waypoint_sampling import VlnSampledWaypointCandidate
+from navprobe.agent.waypoint.types import GroundedWaypointTarget, WaypointPolicyOutput, WaypointPolicyResult
+from navprobe.graph.graph import Graph
+from navprobe.memory.task_progress import TaskProgressItem, TaskProgressMemory, TaskProgressUpdateResult
+from navprobe.perception.goal_identity import GOAL_KIND_VLN_INSTRUCTION
 
 
 def no_match_response():
@@ -92,7 +92,7 @@ class NavProbeGroundingTests(unittest.TestCase):
             observation=SimpleNamespace(T_odom_base=np.eye(4)),
         ))
         client = SimpleNamespace(_create_visual_json_completion=Mock(side_effect=responses))
-        with patch("navclaw.agent.vln_waypoint_policy.draw_vln_sampled_waypoint_bev_overlay",
+        with patch("navprobe.agent.vln_waypoint_policy.draw_vln_sampled_waypoint_bev_overlay",
                    return_value=np.zeros((8, 8, 3), dtype=np.uint8)):
             result = plan_vln_waypoint_loop(
                 client=client, cache=cache, goal_text="", floor_height_m=0.0,

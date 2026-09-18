@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "navagent-v0"
-version = "0.2.0"
+version = "0.3.0"
 description = "Standalone robot-facing NavProbe visual language navigation agent"
 requires-python = ">=3.9"
 dependencies = [
@@ -25,10 +25,13 @@ dependencies = [
 test = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]
-navagent-vln = "navclaw.runners.robot_vln_runner:main"
+navagent-vln = "navprobe.runners.robot_vln_runner:main"
 
 [tool.setuptools.packages.find]
-include = ["frontier_exploration*", "navclaw*"]
+include = ["frontier_exploration*", "navprobe*"]
+
+[tool.setuptools.package-data]
+navprobe = ["assets/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

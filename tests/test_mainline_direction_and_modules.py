@@ -6,17 +6,17 @@ from unittest.mock import patch
 
 import numpy as np
 
-from navclaw.agent.episodic_retrieval import _add_node_rgb_panel
-from navclaw.agent.episodic_retrieval import RetrievalWorkspace
-from navclaw.agent.node_summary import summarize_current_node
-from navclaw.agent.visual_action_context import direction_for_angle
-from navclaw.agent.visual_action_context import ordered_panorama_angles
-from navclaw.agent.visual_action_context import VisualActionContext
-from navclaw.agent.visual_action_context import VisualViewContext
-from navclaw.agent.visual_policy_prompt_images import (
+from navprobe.agent.episodic_retrieval import _add_node_rgb_panel
+from navprobe.agent.episodic_retrieval import RetrievalWorkspace
+from navprobe.agent.node_summary import summarize_current_node
+from navprobe.agent.visual_action_context import direction_for_angle
+from navprobe.agent.visual_action_context import ordered_panorama_angles
+from navprobe.agent.visual_action_context import VisualActionContext
+from navprobe.agent.visual_action_context import VisualViewContext
+from navprobe.agent.visual_policy_prompt_images import (
     image_content_for_current_panorama_views,
 )
-from navclaw.llm.client import LLMClient
+from navprobe.llm.client import LLMClient
 
 
 def _views() -> list[VisualViewContext]:
@@ -44,7 +44,7 @@ def _cache() -> object:
 class MainlineDirectionAndModuleTests(unittest.TestCase):
     def test_model_panorama_order_and_separate_images(self) -> None:
         with patch(
-            "navclaw.agent.visual_policy_prompt_images.image_content_for_camera_array",
+            "navprobe.agent.visual_policy_prompt_images.image_content_for_camera_array",
             return_value={"type": "image_url"},
         ):
             content = image_content_for_current_panorama_views(
@@ -94,7 +94,7 @@ class MainlineDirectionAndModuleTests(unittest.TestCase):
 
         client = SummaryClient()
         with patch(
-            "navclaw.agent.visual_policy_prompt_images.image_content_for_camera_array",
+            "navprobe.agent.visual_policy_prompt_images.image_content_for_camera_array",
             return_value={"type": "image_url"},
         ):
             summary = summarize_current_node(

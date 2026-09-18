@@ -3,23 +3,23 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from navclaw.agent.entity_knowledge import manage_retrieved_knowledge
-from navclaw.agent.episodic_retrieval import (
+from navprobe.agent.entity_knowledge import manage_retrieved_knowledge
+from navprobe.agent.episodic_retrieval import (
     RetrievalWorkspace,
     RetrieveItem,
     RetrieveRequest,
     RetrieveRound,
 )
-from navclaw.agent.visual_action_context import VisualViewContext
-from navclaw.agent.visual_navigation import _vln_backtrack_context_text
-from navclaw.agent.vln_runner import _landmark_categories
-from navclaw.agent.vln_waypoint_policy import (
+from navprobe.agent.visual_action_context import VisualViewContext
+from navprobe.agent.visual_navigation import _vln_backtrack_context_text
+from navprobe.agent.vln_runner import _landmark_categories
+from navprobe.agent.vln_waypoint_policy import (
     _VlnViewCandidateSet,
     _selected_sampled_candidate,
 )
-from navclaw.agent.vln_waypoint_sampling import VlnSampledWaypointCandidate
-from navclaw.graph.graph import Graph
-from navclaw.perception.landmark_detection import LANDMARK_DETECTOR_BOX_THRESHOLD
+from navprobe.agent.vln_waypoint_sampling import VlnSampledWaypointCandidate
+from navprobe.graph.graph import Graph
+from navprobe.perception.landmark_detection import LANDMARK_DETECTOR_BOX_THRESHOLD
 
 
 class PromptContractSyncTests(unittest.TestCase):

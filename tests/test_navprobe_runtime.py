@@ -2,16 +2,16 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from navclaw.agent.actions import AgentAction, AgentActionType
-from navclaw.agent.episodic_retrieval import MemoryIndexEntry
-from navclaw.agent.visual_action_context import VisualActionContext
-from navclaw.agent.visual_navigation import _bind_navigation_subgoal, run_episodic_retrieval_loop
-from navclaw.agent.visual_policy_decisions import NavigationModeDecision
-from navclaw.agent.visual_step_execution import _execute_visual_action_call, _mark_selected_subgoal_started
-from navclaw.graph.graph import Graph
-from navclaw.memory.task_progress import TaskProgressItem, TaskProgressMemory
-from navclaw.perception.goal_identity import GOAL_KIND_OBJECT_CATEGORY, GOAL_KIND_VLN_INSTRUCTION
-from navclaw.schemas import ActionCall, ActionResult
+from navprobe.agent.actions import AgentAction, AgentActionType
+from navprobe.agent.episodic_retrieval import MemoryIndexEntry
+from navprobe.agent.visual_action_context import VisualActionContext
+from navprobe.agent.visual_navigation import _bind_navigation_subgoal, run_episodic_retrieval_loop
+from navprobe.agent.visual_policy_decisions import NavigationModeDecision
+from navprobe.agent.visual_step_execution import _execute_visual_action_call, _mark_selected_subgoal_started
+from navprobe.graph.graph import Graph
+from navprobe.memory.task_progress import TaskProgressItem, TaskProgressMemory
+from navprobe.perception.goal_identity import GOAL_KIND_OBJECT_CATEGORY, GOAL_KIND_VLN_INSTRUCTION
+from navprobe.schemas import ActionCall, ActionResult
 
 
 def executive_response(updates=(), conditions=(), *, retrieve=False, conclusion=None, terminal=None):
@@ -63,11 +63,11 @@ class NavProbeRuntimeTests(unittest.TestCase):
         self.policy = Mock(return_value=navigation())
         self.materialize = Mock(side_effect=self.materialize_evidence)
         for target, kwargs in (
-            ("navclaw.agent.visual_navigation.build_memory_index", {"return_value": entries}),
-            ("navclaw.agent.visual_navigation.decide_vln_navigation_step", {"side_effect": self.policy}),
-            ("navclaw.agent.episodic_retrieval._materialize_request", {"side_effect": self.materialize}),
-            ("navclaw.agent.episodic_retrieval._render_shared_bev", {}),
-            ("navclaw.agent.visual_navigation.manage_retrieved_knowledge", {"return_value": {}}),
+            ("navprobe.agent.visual_navigation.build_memory_index", {"return_value": entries}),
+            ("navprobe.agent.visual_navigation.decide_vln_navigation_step", {"side_effect": self.policy}),
+            ("navprobe.agent.episodic_retrieval._materialize_request", {"side_effect": self.materialize}),
+            ("navprobe.agent.episodic_retrieval._render_shared_bev", {}),
+            ("navprobe.agent.visual_navigation.manage_retrieved_knowledge", {"return_value": {}}),
         ):
             patcher = patch(target, **kwargs)
             patcher.start()
@@ -148,7 +148,7 @@ class NavProbeRuntimeTests(unittest.TestCase):
             self.assertEqual(self.memory.items[0].start_node_id, "")
             return ActionResult(ok=True, data={"path_xy": [[0.0, 0.0], [1.0, 0.0]]})
         self.state.action_executor = SimpleNamespace(execute=Mock(side_effect=execute))
-        with patch("navclaw.agent.visual_step_execution.set_pending_node_move") as record_move:
+        with patch("navprobe.agent.visual_step_execution.set_pending_node_move") as record_move:
             _execute_visual_action_call(
                 state=self.state, step=self.step, action=action, action_call=call,
                 decision_payload={"navigation_mode": selected.to_dict(), "planning_node_id": "virtual-anchor"},
@@ -215,7 +215,7 @@ class NavProbeRuntimeTests(unittest.TestCase):
             navigation("backtrack", backtrack_anchor_node_id=str(anchor.id), backtrack_reason="Earlier doorway needs reconsideration.", backtrack_objective="Inspect the kitchen entrance."),
             navigation(subgoal_id="sg2"),
         ]
-        with patch("navclaw.agent.visual_navigation.build_visual_action_context_for_node", return_value=VisualActionContext(current_node_id=str(anchor.id), views=[])), patch("navclaw.agent.visual_navigation.build_vln_landmark_context", return_value=None):
+        with patch("navprobe.agent.visual_navigation.build_visual_action_context_for_node", return_value=VisualActionContext(current_node_id=str(anchor.id), views=[])), patch("navprobe.agent.visual_navigation.build_vln_landmark_context", return_value=None):
             result = self.run_loop()
         self.assertEqual(result.planning_visual_context.current_node_id, str(anchor.id))
         self.assertEqual(self.memory.history[0]["completion_node_id"], self.context.current_node_id)

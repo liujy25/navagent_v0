@@ -1,1 +1,0 @@
-"""NavClaw navigation agent package."""

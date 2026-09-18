@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from navclaw.env.robot_rpc_env import RobotRPCEnv
-from navclaw.env.rpc_protocol import encode_array, encode_depth_meters, encode_rgb_image
+from navprobe.env.robot_rpc_env import RobotRPCEnv
+from navprobe.env.rpc_protocol import encode_array, encode_depth_meters, encode_rgb_image
 
 
 def _observation_payload() -> dict[str, object]:
@@ -40,7 +40,7 @@ def test_robot_rpc_observation_and_move_history(monkeypatch) -> None:
             url=url,
         )
 
-    monkeypatch.setattr("navclaw.env.robot_rpc_env.requests.post", fake_post)
+    monkeypatch.setattr("navprobe.env.robot_rpc_env.requests.post", fake_post)
     env = RobotRPCEnv("http://robot:1877")
     observation = env.get_obs()
     assert observation.rgb.shape == (4, 5, 3)

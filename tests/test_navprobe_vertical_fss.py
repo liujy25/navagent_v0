@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from navclaw.agent.vertical_fss import (
+from navprobe.agent.vertical_fss import (
     _connected_support,
     _fuse_vertical_support_with_map,
     _detected_stair_mask,
@@ -12,30 +12,30 @@ from navclaw.agent.vertical_fss import (
     _temporary_stair_support,
     prepare_vertical_fss_candidates,
 )
-from navclaw.agent.vertical_transition import (
+from navprobe.agent.vertical_transition import (
     _complete_vertical_transition,
     _record_vertical_transition_node_move,
     execute_vertical_transition_action,
 )
-from navclaw.agent.vertical_transition_policy import (
+from navprobe.agent.vertical_transition_policy import (
     VerticalTransitionStepDecision,
     _normalize_vertical_transition_step,
     decide_vertical_transition_step,
     select_vertical_fss_waypoint,
 )
-from navclaw.agent.visual_action_context import VisualActionContext, VisualViewContext
-from navclaw.env.interface import Pose, RawObservation
-from navclaw.memory.task_progress import TaskProgressMemory
-from navclaw.perception.detectors.interface import Detection2D
-from navclaw.runtime.cache import RuntimeCache
-from navclaw.mapping.exploration.bev_map import GlobalBEVMap
-from navclaw.schemas import ActionResult
+from navprobe.agent.visual_action_context import VisualActionContext, VisualViewContext
+from navprobe.env.interface import Pose, RawObservation
+from navprobe.memory.task_progress import TaskProgressMemory
+from navprobe.perception.detectors.interface import Detection2D
+from navprobe.runtime.cache import RuntimeCache
+from navprobe.mapping.exploration.bev_map import GlobalBEVMap
+from navprobe.schemas import ActionResult
 
 
 class NavProbeVerticalFssTest(unittest.TestCase):
-    @patch("navclaw.agent.vertical_fss._horizontal_support_mask")
-    @patch("navclaw.agent.vertical_fss._backproject")
-    @patch("navclaw.agent.vertical_fss._projected_views_for_waypoint")
+    @patch("navprobe.agent.vertical_fss._horizontal_support_mask")
+    @patch("navprobe.agent.vertical_fss._backproject")
+    @patch("navprobe.agent.vertical_fss._projected_views_for_waypoint")
     def test_detected_stairs_extend_only_temporary_traversability(self, projections, backproject, horizontal):
         cache = RuntimeCache()
         transform = np.eye(4)
@@ -165,10 +165,10 @@ class NavProbeVerticalFssTest(unittest.TestCase):
         self.assertEqual(frontier, [item for item in fss if item["anchor_source"] == "frontier"])
 
     def test_vertical_grounder_forwards_frontier_only_policy(self):
-        from navclaw.agent.vertical_transition import _plan_navprobe_vertical_waypoint
+        from navprobe.agent.vertical_transition import _plan_navprobe_vertical_waypoint
         state = SimpleNamespace(cache=Mock(), detector=Mock(), global_exploration_for_floor=Mock(),
                                 system=SimpleNamespace(current_floor_id="f0", current_floor_height=0.0))
-        with patch("navclaw.agent.vertical_transition.prepare_vertical_fss_candidates", side_effect=ValueError("captured")) as prepare:
+        with patch("navprobe.agent.vertical_transition.prepare_vertical_fss_candidates", side_effect=ValueError("captured")) as prepare:
             for policy in ("frontier", "frontier_skeleton_sample"):
                 state.waypoint_policy_name = policy
                 with self.assertRaisesRegex(ValueError, "captured"):
@@ -177,7 +177,7 @@ class NavProbeVerticalFssTest(unittest.TestCase):
                                                     objective="Reach the landing.", task_context="")
                 self.assertEqual(prepare.call_args.kwargs["frontier_only"], policy == "frontier")
 
-    @patch("navclaw.agent.vertical_transition_policy.image_content_for_vertical_transition_panorama_views", return_value=[])
+    @patch("navprobe.agent.vertical_transition_policy.image_content_for_vertical_transition_panorama_views", return_value=[])
     def test_partial_stair_endpoint_is_preserved_in_local_controller(self, _images):
         client = Mock()
         client.decide_vertical_transition_step.return_value = {
@@ -203,8 +203,8 @@ class NavProbeVerticalFssTest(unittest.TestCase):
                 {"transition_status": "complete", "waypoint_target": "", "selected_direction": None, "reason": "At target"},
             )
 
-    @patch("navclaw.agent.vertical_transition._resolve_vertical_transition_floor")
-    @patch("navclaw.agent.vertical_transition._create_place_node", return_value="n1")
+    @patch("navprobe.agent.vertical_transition._resolve_vertical_transition_floor")
+    @patch("navprobe.agent.vertical_transition._create_place_node", return_value="n1")
     def test_partial_stair_completion_does_not_invent_a_floor(self, _create, resolve):
         cache = RuntimeCache()
         obs_id = cache.store_observation(RawObservation(pose=Pose(x=1.0, y=0.0, z=0.15, yaw=0))).id
@@ -272,7 +272,7 @@ class NavProbeVerticalFssTest(unittest.TestCase):
         with ExitStack() as stack:
             mocked = {}
             for name in ("_vertical_panorama_from_current_step", "_capture_vertical_panorama", "_visual_context_from_panorama", "_panorama_anchor_height", "_plan_navprobe_vertical_waypoint", "_execute_vt_move", "_vertical_transition_va_history_entry", "_finish_vertical_transition_action", "decide_vertical_transition_step"):
-                mocked[name] = stack.enter_context(patch("navclaw.agent.vertical_transition." + name))
+                mocked[name] = stack.enter_context(patch("navprobe.agent.vertical_transition." + name))
             mocked["_panorama_anchor_height"].return_value = 0.18
             mocked["_plan_navprobe_vertical_waypoint"].return_value = plan
             mocked["_execute_vt_move"].return_value = result
@@ -288,7 +288,7 @@ class NavProbeVerticalFssTest(unittest.TestCase):
         self.assertEqual(memory.completed_stair_items, {})
 
     def test_vertical_move_log_retains_selected_fss_label(self):
-        from navclaw.agent.vertical_transition import _vertical_transition_va_history_entry
+        from navprobe.agent.vertical_transition import _vertical_transition_va_history_entry
         waypoint = SimpleNamespace(goal_xy=(1.0, 0.0), goal_yaw=0.0, path_xy=[(0.0, 0.0), (1.0, 0.0)], depth_m=1.0, raw_world_z=0.2)
         plan = SimpleNamespace(
             waypoint=waypoint, selected_view=SimpleNamespace(angle_deg=0, obs_id="obs1"),
@@ -312,7 +312,7 @@ class NavProbeVerticalFssTest(unittest.TestCase):
         self.assertEqual(state.node_move_history[0]["subgoal_id"], "sg3")
         self.assertEqual(state.node_move_history[0]["subgoal_attempt"], 2)
 
-    @patch("navclaw.agent.vertical_transition_policy.image_content_for_array", return_value={"type": "image_url"})
+    @patch("navprobe.agent.vertical_transition_policy.image_content_for_array", return_value={"type": "image_url"})
     def test_fss_selector_keeps_shared_label_and_executive_context(self, _image):
         client = Mock()
         client._create_visual_json_completion.return_value = {"candidate_label": 3, "reason": "The third tread matches the requested stop."}

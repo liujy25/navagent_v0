@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import navclaw.llm.client as client_module
-from navclaw.agent.actions import AgentActionType
-from navclaw.config.vln_runtime import VlnRuntimeConfig
-from navclaw.perception.goal import vln_instruction_goal_spec
-from navclaw.runtime.panorama_config import robot_panorama_config
-from navclaw.runners.robot_vln_runner import build_parser
+import navprobe.llm.client as client_module
+from navprobe.agent.actions import AgentActionType
+from navprobe.config.vln_runtime import VlnRuntimeConfig
+from navprobe.perception.goal import vln_instruction_goal_spec
+from navprobe.runtime.panorama_config import robot_panorama_config
+from navprobe.runners.robot_vln_runner import build_parser
 
 
 def test_cli_exposes_only_robot_vln_controls() -> None:
@@ -59,6 +59,7 @@ def test_robot_panorama_uses_front_left_back_right_views() -> None:
 
 def test_one_model_is_used_for_every_completion(monkeypatch) -> None:
     requests: list[dict[str, object]] = []
+    clients: list[dict[str, object]] = []
 
     class FakeCompletions:
         def create(self, **kwargs):
@@ -75,7 +76,8 @@ def test_one_model_is_used_for_every_completion(monkeypatch) -> None:
             )
 
     class FakeOpenAI:
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
+            clients.append(kwargs)
             self.chat = SimpleNamespace(completions=FakeCompletions())
 
     monkeypatch.setattr(client_module, "OpenAI", FakeOpenAI)
@@ -84,15 +86,27 @@ def test_one_model_is_used_for_every_completion(monkeypatch) -> None:
         api_key="test-key",
         base_url="https://provider.example/v1",
     )
-    parsed = client._create_visual_json_completion(
-        call_name="test",
-        system_prompt="system",
-        user_prompt="user",
-        max_new_tokens=32,
-        token_field="max_completion_tokens",
-        retry_count=1,
-        client_kind="va",
-    )
-    assert parsed == {"ok": True}
-    assert requests[0]["model"] == "test-model"
-    assert client.get_usage_summary()["total_tokens"] == 12
+    for method in (
+        client.generate_task_progress_memory,
+        client.decide_vln_task_progress_step,
+        client.decide_vln_navigation_step,
+        client.manage_knowledge,
+        client.summarize_node,
+        client.decide_vertical_transition_step,
+    ):
+        assert method("system", "user") == {"ok": True}
+    for call_name in ("vln_waypoint_planner", "vertical_fss_waypoint_planner", "vln_landmark_detection_list"):
+        assert client._create_visual_json_completion(
+            call_name=call_name,
+            system_prompt="system",
+            user_prompt=[{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA=="}}],
+            max_new_tokens=32,
+            token_field="max_completion_tokens",
+            retry_count=1,
+        ) == {"ok": True}
+    assert len(clients) == 1
+    assert clients[0]["base_url"] == "https://provider.example/v1"
+    assert clients[0]["api_key"] == "test-key"
+    assert len(requests) == 9
+    assert {request["model"] for request in requests} == {"test-model"}
+    assert client.get_usage_summary()["total_tokens"] == 108

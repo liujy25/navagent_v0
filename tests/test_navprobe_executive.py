@@ -5,17 +5,17 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from navclaw.agent.episodic_retrieval import RetrieveRequest
-from navclaw.agent.visual_action_context import VisualActionContext
-from navclaw.agent.visual_policy import decide_vln_navigation_step
-from navclaw.agent.visual_policy import decide_vln_task_progress_step
-from navclaw.agent.visual_policy import ensure_task_progress_memory
-from navclaw.agent.visual_policy import normalize_vln_navigation_step
-from navclaw.agent.visual_policy import normalize_vln_task_progress_step
-from navclaw.agent.visual_policy_decisions import TaskProgressDecision
-from navclaw.memory.task_progress import TaskProgressMemory
-from navclaw.perception.goal_identity import GOAL_KIND_OBJECT_CATEGORY
-from navclaw.perception.goal_identity import GOAL_KIND_VLN_INSTRUCTION
+from navprobe.agent.episodic_retrieval import RetrieveRequest
+from navprobe.agent.visual_action_context import VisualActionContext
+from navprobe.agent.visual_policy import decide_vln_navigation_step
+from navprobe.agent.visual_policy import decide_vln_task_progress_step
+from navprobe.agent.visual_policy import ensure_task_progress_memory
+from navprobe.agent.visual_policy import normalize_vln_navigation_step
+from navprobe.agent.visual_policy import normalize_vln_task_progress_step
+from navprobe.agent.visual_policy_decisions import TaskProgressDecision
+from navprobe.memory.task_progress import TaskProgressMemory
+from navprobe.perception.goal_identity import GOAL_KIND_OBJECT_CATEGORY
+from navprobe.perception.goal_identity import GOAL_KIND_VLN_INSTRUCTION
 
 
 def agenda(goal="Enter the kitchen, then stop beside the table.", objectives=()):

@@ -1,3 +1,66 @@
+# Current synchronization: NavProbe naming and VA cleanup
+
+Date: 2026-09-18. Upstream: `7e2699971dc854d8ed875a8c2cc8fe01f9518777`.
+Robot baseline: `77f00c1`; package release: `0.3.0`.
+
+## Robot experiment changes
+
+- The Python package is now `navprobe`; imports, agent types (`NavProbeAgentState`,
+  `NavProbeAgentContext`, `NavProbeStepState`), prompts, asset references, and test
+  patches use the canonical names. No old-package alias is provided.
+- Model configuration uses `NAVPROBE_MODEL` or `--model`. The old `NAVCLAW_MODEL`
+  variable is no longer read. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and their CLI
+  overrides remain unchanged. All modules still use one multimodal client.
+- Removed the ignored `client_kind` parameter and every caller argument, including
+  FSS, stair FSS, and the robot landmark generator. Removed the unused
+  `LLMClient.decide_visual_action` method, matching upstream VA API removal.
+  The robot package already excluded VA clients, bbox/pixel methods and schemas,
+  so those require no additional migration. Active FSS visual inputs remain.
+- ROS node/thread names use `navprobe`; update custom ROS configurations that
+  address the former names. HTTP endpoints, wire format, Nav2 actions, metric
+  depth, and 90-degree panorama turns are unchanged.
+- Renamed assets retain their original bytes. Explicit package-data configuration
+  now includes the four PNG icons in wheels; installation checks found they were
+  previously omitted by the package build rules.
+
+The repository/distribution name `navagent-v0`, console command `navagent-vln`,
+and scripts `run_vln_robot.py` / `serve_robot_rpc.py` remain the robot delivery
+interface. The experiment stays independent of the sibling NavProbe checkout.
+UniLaViRA single-floor dataset selection and simulation batch metadata changes
+are outside the robot runtime and were not imported.
+
+## Upgrade
+
+Run in each environment using this repository (compute machine and robot bridge):
+
+```bash
+pip install -e .
+export NAVPROBE_MODEL="your-multimodal-model"
+python scripts/run_vln_robot.py --help
+```
+
+Update custom Python imports to `navprobe` and environment/ROS launch references
+as described above. Existing `--model`, `--api-key`, `--base-url`, `--robot-url`,
+and `--instruction` arguments keep their meaning.
+
+## Validation
+
+- All 109 tests pass, including the complete simulated robot RPC/FSS/stop cases.
+- Model-routing coverage exercises nine active completion paths against one
+  configured client and checks aggregate usage.
+- Seven complete representative model requests match upstream `7e26999`
+  byte-for-byte (including the updated NavProbe brand and removed route argument).
+- Source and tests resolve the renamed package; syntax and undefined-name/unused
+  import checks pass. Binary assets match the previous robot release.
+- The wheel builds, includes all four icons, and its installed `navagent-vln`
+  entry point loads the renamed robot runner. No physical robot, ROS process,
+  detector weights, or online model calls were used in these checks.
+
+The previous synchronization record below is historical; its old package names
+and version statements describe release 0.2.0, not the current interface.
+
+---
+
 # NavProbe synchronization — 2026-09-18
 
 Upstream: `navagent-agent-mvp`, commit

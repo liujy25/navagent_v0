@@ -11,7 +11,7 @@ language navigation (VLN) agent. It contains one algorithm configuration:
 - observation-grounded stair FSS and local vertical movements;
 - YOLO-World landmark detection.
 
-The algorithm is synchronized to NavProbe commit `f26d5a1` (2026-09-18), while
+The algorithm and naming are synchronized to NavProbe commit `7e26999` (2026-09-18), while
 retaining this repository's robot interfaces. The original instruction remains
 available to the Executive and semantic skill selector. The waypoint grounder
 receives a self-contained selected skill and candidate evidence. Task updates
@@ -34,6 +34,13 @@ Python 3.9 or newer is required. Install the algorithm package with:
 pip install -e .
 ```
 
+When upgrading from 0.2.x, rerun this installation command in each environment
+that runs the agent or robot bridge. The Python package is now `navprobe`, and
+the model environment variable is `NAVPROBE_MODEL`. Update custom imports and
+launch configurations accordingly; the old package and variable are not aliases.
+The repository/distribution name `navagent-v0`, command `navagent-vln`, and the
+two script filenames remain unchanged.
+
 YOLO-World weights are not bundled. Put a compatible checkpoint at
 `weights/yolov8x-world.pt`, or pass `--yolow-model`.
 
@@ -52,18 +59,18 @@ Then run the agent on the compute machine:
 
 ```bash
 export OPENAI_API_KEY="..."
-export NAVCLAW_MODEL="gpt-5.2"
+export NAVPROBE_MODEL="gpt-5.2"
 
 python scripts/run_vln_robot.py \
   --robot-url http://ROBOT_IP:1877 \
   --instruction "Leave the office, turn left, and stop by the red chair." \
-  --model "$NAVCLAW_MODEL" \
+  --model "$NAVPROBE_MODEL" \
   --output outputs/episode.json
 ```
 
 For an OpenAI-compatible provider, also set `OPENAI_BASE_URL` or pass
 `--base-url`. The `--model` value is used by every language and visual-language
-module; there are no hidden VA/LA model overrides.
+module; no separate VA configuration is required or read.
 
 By default the agent captures four RGB-D views facing front, left, back, and
 right, separated by 90-degree left turns. The physical capture order is front,
