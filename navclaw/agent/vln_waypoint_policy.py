@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
@@ -44,14 +45,11 @@ Use the current active progress item as the immediate waypoint objective.
 """.strip()
 
 VLN_WAYPOINT_GROUNDING_SYSTEM_PROMPT = """
-You are the Waypoint Planner in NavClaw.
-Ground the fixed high-level navigation action into exactly one provided FSS world-space waypoint candidate and select the RGB view that best supports that grounding.
-Do not change the high-level action, update task progress, or retrieve historical evidence.
+You are the waypoint grounder of an embodied navigation agent.
+Ground the selected skill's local intent into a provided FSS waypoint label, using the labeled RGB views and BEV. Identify the view supporting the selection, or report that no candidate matches.
 Return only valid JSON matching the provided output contract.
 """.strip()
 
-VLN_WAYPOINT_INHERITED_CONTEXT_SYSTEM_PROMPT = VLN_WAYPOINT_GROUNDING_SYSTEM_PROMPT
-VLN_WAYPOINT_ACTIVE_PROGRESS_SYSTEM_PROMPT = VLN_WAYPOINT_GROUNDING_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -72,8 +70,84 @@ class _VlnViewCandidateSet:
     rgb_overlay: np.ndarray
 
 
+@dataclass(frozen=True)
+class VlnPreparedWaypointCandidates:
+    visual_context: VisualActionContext
+    view_candidate_sets: list[_VlnViewCandidateSet]
+    evidences: list[VlnLandmarkEvidence]
+    candidate_bev_overlay: np.ndarray | None
+    generation_failures: list[dict[str, object]] = field(default_factory=list)
+
+    @property
+    def candidates(self) -> list[VlnSampledWaypointCandidate]:
+        return _all_view_candidates(self.view_candidate_sets)
+
+    @property
+    def available_labels_by_angle(self) -> dict[int, set[int]]:
+        return {
+            int(item.view.angle_deg): {int(candidate.label) for candidate in item.candidates}
+            for item in _ordered_view_candidate_sets(self.view_candidate_sets)
+        }
+
+    def selected(
+        self,
+        *,
+        angle_deg: int,
+        candidate_label: int,
+    ) -> tuple[VisualViewContext, VlnSampledWaypointCandidate]:
+        for item in self.view_candidate_sets:
+            if int(item.view.angle_deg) != int(angle_deg):
+                continue
+            for candidate in item.candidates:
+                if int(candidate.label) == int(candidate_label):
+                    return item.view, candidate
+        raise ValueError(
+            "missing sampled waypoint candidate "
+            f"direction={direction_for_angle(angle_deg)} label={candidate_label}"
+        )
+
+    def rgb_overlay_for_angle(self, angle_deg: int) -> np.ndarray:
+        return _rgb_overlay_for_view(
+            view_candidate_sets=self.view_candidate_sets,
+            selected_view=self.visual_context.view_for_angle(int(angle_deg)),
+        )
+
+    def prompt_text(self, *, node_id: str) -> str:
+        context_text = _waypoint_rgb_context_text(
+            self.view_candidate_sets,
+            evidences=self.evidences,
+            include_graph_context=self.visual_context.graph_context_visible,
+        )
+        return "\n".join(
+            [
+                f"Sampled waypoint candidates for reference_node_id {node_id}:",
+                context_text,
+            ]
+        )
+
+    def prompt_images(self) -> list[tuple[str, np.ndarray]]:
+        return [
+            (
+                _view_overlay_prompt_text(
+                    item,
+                    evidences=self.evidences,
+                    include_graph_context=self.visual_context.graph_context_visible,
+                ),
+                np.asarray(item.rgb_overlay, dtype=np.uint8),
+            )
+            for item in _ordered_view_candidate_sets(self.view_candidate_sets)
+        ]
+
+
+SampledCandidateSetBuilder = Callable[
+    ...,
+    tuple[list[_VlnViewCandidateSet], list[dict[str, object]]],
+]
+
+
 def _build_sampled_candidate_sets(
     *,
+    candidate_set_builder: SampledCandidateSetBuilder | None,
     exploration: "ExplorationManager",
     cache: "RuntimeCache",
     visual_context: VisualActionContext,
@@ -86,20 +160,78 @@ def _build_sampled_candidate_sets(
     node_dedup_radius_m: float = VLN_WAYPOINT_NODE_DEDUP_RADIUS_M,
     sample_spacing_m: float = VLN_WAYPOINT_SAMPLE_SPACING_M,
     max_distance_m: float = VLN_WAYPOINT_MAX_DISTANCE_M,
+    frontier_only: bool = False,
 ) -> tuple[list[_VlnViewCandidateSet], list[dict[str, object]]]:
+    common_kwargs = {
+        "exploration": exploration,
+        "cache": cache,
+        "visual_context": visual_context,
+        "robot_xy": robot_xy,
+        "world_z": float(world_z),
+        "evidences": evidences,
+        "avoid_node_xys": avoid_node_xys,
+    }
+    if candidate_set_builder is not None:
+        return candidate_set_builder(**common_kwargs)
     return _generate_all_view_sampled_candidates(
-        exploration=exploration,
-        cache=cache,
-        visual_context=visual_context,
-        robot_xy=robot_xy,
-        world_z=float(world_z),
-        evidences=evidences,
-        avoid_node_xys=avoid_node_xys,
+        **common_kwargs,
         frontier_records=frontier_records,
         node_dedup_map=node_dedup_map,
         node_dedup_radius_m=float(node_dedup_radius_m),
         sample_spacing_m=float(sample_spacing_m),
         max_distance_m=float(max_distance_m),
+        frontier_only=frontier_only,
+    )
+
+
+def prepare_vln_waypoint_candidates(
+    *,
+    cache: "RuntimeCache",
+    visual_context: VisualActionContext,
+    exploration: "ExplorationManager",
+    floor_height_m: float,
+    landmark_evidences: list[VlnLandmarkEvidence] | None = None,
+    frontier_records: dict[str, "LocalmapFrontierRecord"] | None = None,
+    avoid_node_xys: list[tuple[float, float]] | None = None,
+    node_dedup_map: "GlobalBEVMap | None" = None,
+    node_dedup_radius_m: float = VLN_WAYPOINT_NODE_DEDUP_RADIUS_M,
+    candidate_set_builder: SampledCandidateSetBuilder | None = None,
+    sample_spacing_m: float = VLN_WAYPOINT_SAMPLE_SPACING_M,
+    max_distance_m: float = VLN_WAYPOINT_MAX_DISTANCE_M,
+    frontier_only: bool = False,
+) -> VlnPreparedWaypointCandidates:
+    evidences = list(landmark_evidences or [])
+    robot_xy = _robot_xy_from_visual_context(cache=cache, visual_context=visual_context)
+    view_candidate_sets, failures = _build_sampled_candidate_sets(
+        candidate_set_builder=candidate_set_builder,
+        exploration=exploration,
+        cache=cache,
+        visual_context=visual_context,
+        robot_xy=robot_xy,
+        world_z=float(floor_height_m),
+        evidences=evidences,
+        frontier_records=frontier_records,
+        avoid_node_xys=avoid_node_xys,
+        node_dedup_map=node_dedup_map,
+        node_dedup_radius_m=float(node_dedup_radius_m),
+        sample_spacing_m=float(sample_spacing_m),
+        max_distance_m=float(max_distance_m),
+        frontier_only=frontier_only,
+    )
+    all_candidates = _all_view_candidates(view_candidate_sets)
+    candidate_bev_overlay = None
+    if all_candidates != []:
+        candidate_bev_overlay = draw_vln_sampled_waypoint_bev_overlay(
+            exploration=exploration,
+            robot_xy=robot_xy,
+            candidates=all_candidates,
+        )
+    return VlnPreparedWaypointCandidates(
+        visual_context=visual_context,
+        view_candidate_sets=view_candidate_sets,
+        evidences=evidences,
+        candidate_bev_overlay=candidate_bev_overlay,
+        generation_failures=failures,
     )
 
 
@@ -129,10 +261,12 @@ def plan_vln_waypoint_loop(
     avoid_node_xys: list[tuple[float, float]] | None = None,
     node_dedup_map: "GlobalBEVMap | None" = None,
     node_dedup_radius_m: float = VLN_WAYPOINT_NODE_DEDUP_RADIUS_M,
+    candidate_set_builder: SampledCandidateSetBuilder | None = None,
     sample_spacing_m: float = VLN_WAYPOINT_SAMPLE_SPACING_M,
     max_distance_m: float = VLN_WAYPOINT_MAX_DISTANCE_M,
     show_cardinal_border: bool = False,
     heading_reference: str = "the current robot heading",
+    frontier_only: bool = False,
 ) -> VlnWaypointLoopResult:
     evidences: list[VlnLandmarkEvidence] = list(landmark_evidences or [])
     loop_events: list[dict[str, object]] = []
@@ -142,6 +276,7 @@ def plan_vln_waypoint_loop(
     for _ in range(VLN_WAYPOINT_REPLAN_MAX_ATTEMPTS):
         robot_xy = _robot_xy_from_visual_context(cache=cache, visual_context=visual_context)
         view_candidate_sets, candidate_generation_failures = _build_sampled_candidate_sets(
+            candidate_set_builder=candidate_set_builder,
             exploration=exploration,
             cache=cache,
             visual_context=visual_context,
@@ -154,6 +289,7 @@ def plan_vln_waypoint_loop(
             node_dedup_radius_m=float(node_dedup_radius_m),
             sample_spacing_m=float(sample_spacing_m),
             max_distance_m=float(max_distance_m),
+            frontier_only=frontier_only,
         )
         all_candidates = _all_view_candidates(view_candidate_sets)
         if all_candidates == []:
@@ -204,6 +340,27 @@ def plan_vln_waypoint_loop(
             include_graph_context=visual_context.graph_context_visible,
             heading_reference=str(heading_reference),
         )
+        if (
+            "candidate_label" in candidate_response
+            and candidate_response["candidate_label"] is None
+            and str(candidate_response.get("reasoning", "")).strip()
+        ):
+            failure_reason = "navigation_intent_has_no_matching_waypoint"
+            navigation_replan_feedback.append({
+                "failure_reason": failure_reason,
+                "failure_summary": str(candidate_response.get("failure_reason") or candidate_response["reasoning"]),
+                "grounding_response": deepcopy(candidate_response),
+                "candidate_labels_by_direction": {
+                    direction_for_angle(item.view.angle_deg): [candidate.label for candidate in item.candidates]
+                    for item in view_candidate_sets
+                },
+            })
+            return VlnWaypointLoopResult(
+                local_move_plan=None, selected_view=None, visual_action=None, waypoint=None,
+                attempt_records=attempt_records,
+                navigation_replan_feedback=navigation_replan_feedback,
+                failure_reason=failure_reason,
+            )
         selected_candidate, selected_view, candidate_failure_reason = _selected_sampled_candidate(
             response=candidate_response,
             view_candidate_sets=view_candidate_sets,
@@ -306,6 +463,7 @@ def _generate_all_view_sampled_candidates(
     node_dedup_radius_m: float = VLN_WAYPOINT_NODE_DEDUP_RADIUS_M,
     sample_spacing_m: float = VLN_WAYPOINT_SAMPLE_SPACING_M,
     max_distance_m: float = VLN_WAYPOINT_MAX_DISTANCE_M,
+    frontier_only: bool = False,
 ) -> tuple[list[_VlnViewCandidateSet], list[dict[str, object]]]:
     view_candidate_sets: list[_VlnViewCandidateSet] = []
     failures: list[dict[str, object]] = []
@@ -326,6 +484,7 @@ def _generate_all_view_sampled_candidates(
             node_dedup_radius_m=float(node_dedup_radius_m),
             sample_spacing_m=float(sample_spacing_m),
             max_distance_m=float(max_distance_m),
+            frontier_only=frontier_only,
         )
     except ValueError as exc:
         return [], [
@@ -414,11 +573,7 @@ def _run_vln_sampled_waypoint_candidate_selector(
     heading_reference: str = "the current robot heading",
 ) -> dict[str, object]:
     active_item = str(active_progress_item).strip()
-    if active_item != "":
-        prompt_text = _build_vln_active_progress_waypoint_prompt(
-            loop_events=loop_events,
-        )
-    elif inherited_agent_context_content:
+    if active_item or inherited_agent_context_content:
         prompt_text = _build_vln_inherited_waypoint_grounding_prompt(
             loop_events=loop_events,
         )
@@ -491,10 +646,8 @@ def _run_vln_sampled_waypoint_candidate_selector(
                 user_prompt.append(image_content_for_array(np.asarray(image, dtype=np.uint8)))
     if inherited_agent_context_content:
         user_prompt.append({"type": "text", "text": prompt_text})
-    if active_item != "":
-        system_prompt = VLN_WAYPOINT_ACTIVE_PROGRESS_SYSTEM_PROMPT
-    elif inherited_agent_context_content:
-        system_prompt = VLN_WAYPOINT_INHERITED_CONTEXT_SYSTEM_PROMPT
+    if active_item or inherited_agent_context_content:
+        system_prompt = VLN_WAYPOINT_GROUNDING_SYSTEM_PROMPT
     else:
         system_prompt = VLN_WAYPOINT_CANDIDATE_SELECTOR_SYSTEM_PROMPT
     if active_item == "" and not inherited_agent_context_content and not (
@@ -567,13 +720,6 @@ def _candidate_bev_prompt_text(
     return text
 
 
-def _build_vln_active_progress_waypoint_prompt(
-    *,
-    loop_events: list[dict[str, object]],
-) -> str:
-    return _build_vln_inherited_waypoint_grounding_prompt(loop_events=loop_events)
-
-
 def _build_vln_inherited_waypoint_grounding_prompt(
     *,
     loop_events: list[dict[str, object]],
@@ -585,37 +731,36 @@ def _build_vln_inherited_waypoint_grounding_prompt(
         if retry_summary != "none"
         else ""
     )
+    selection_rules = """
+Workflow:
+1. Identify the local target, direction, constraints, and supporting evidence in the selected skill's `reason`, `objective`, or `waypoint_target`.
+2. Compare labeled candidates in the RGB views and BEV. Match the local intent to a connected walking surface.
+3. Return the matching `candidate_label`, the RGB view that best supports it as `selected_direction`, and concise grounding evidence in `reasoning`.
+
+Selection rules:
+- Select exactly one available label that is visible in the chosen grounding view.
+- Select a candidate on visible connected walking surface, doorway floor, corridor floor, stair tread or landing when applicable, or other safe free space.
+- Reject candidates projected onto a wall, ceiling, furniture or object surface, clutter, window, mirror, railing, or door leaf.
+- For an object or fixture reference, choose nearby reachable floor rather than the object surface.
+- Judge a candidate by its projected walking surface and world-space geometry; proximity between overlay labels is not spatial evidence.
+- Interpret detector labels using the visible scene and the skill's evidence about the target.
+""".strip()
     return f"""
 Candidate semantics:
 - `candidate_label` identifies one provided world-space waypoint.
 - The same label in multiple RGB views refers to the same world-space waypoint.
 - `selected_direction` identifies the RGB view used to ground and explain the waypoint; it is not a second high-level navigation action.
-- The high-level action's `direction`, when present, constrains the world-space route direction. The selected grounding view may differ when the same candidate is clearer in another view.
-- White numbered circles are selectable waypoint candidates.
-- Blue numbered circles are visited-node overlays, not physical objects or selectable waypoints.
-- Landmark boxes and labels are visual evidence, not waypoint surfaces.
+- The skill's `direction`, when present, constrains the world-space route direction in the supplied reference frame. The selected grounding view may differ when the same candidate is clearer in another view.
 
-Selection rules:
-- Preserve the fixed high-level action and its parameters.
-- Select exactly one available label that is visible in the chosen grounding view.
-- Use updated progress and retrieval conclusions to interpret route intent; an unconfirmed condition is not an established fact.
-- Use directional RGB overlays to compare semantic route support and visible local passage structure.
-- Use the candidate BEV to compare candidate geometry, route direction, connectivity, and relative position.
-- Select a candidate on visible connected walking surface, doorway floor, corridor floor, stair tread or landing when applicable, or other safe free space.
-- Reject candidates projected onto a wall, ceiling, furniture or object surface, clutter, window, mirror, railing, or door leaf.
-- For an object or fixture reference, choose nearby reachable floor rather than the object surface.
-- The selected candidate's world-space position must advance the route direction and semantic objective specified by PCNP.
-- When one candidate appears in multiple views, choose the view that most clearly shows the relevant passage, target relation, or walking surface.
-- Do not select a candidate because its label is visually close to a landmark or node overlay.
-- Do not choose a different route branch because another candidate looks easier; route replanning belongs to PCNP.
-- `reasoning` identifies the decisive RGB and/or BEV evidence.
+{selection_rules}
 
 Output contract:
 {{
-  "reasoning": "<concise grounding evidence for the fixed high-level action>",
+  "reasoning": "<concise geometric and visual evidence for the local intent>",
   "selected_direction": "front|back|left|right",
   "candidate_label": 1
-}}{retry_section}
+}}
+If no candidate matches the local intent on a supported walking surface, return `candidate_label=null`, `selected_direction=null`, and explain the mismatch in `reasoning` and `failure_reason`.{retry_section}
 """.strip()
 
 
@@ -809,6 +954,11 @@ def _view_overlay_prompt_text(
         visible_nodes = _visible_node_labels_text(view_candidate_set.view)
         if visible_nodes != "none":
             lines.append(f"- Visible visited nodes: {visible_nodes}.")
+        if view_candidate_set.view.visible_arrival_edge_ids:
+            lines.append(
+                "- The blue curve and arrows show the last executed movement toward "
+                "the current position, smoothed for display."
+            )
     visible_landmarks = _landmark_labels_text(evidences, angle_deg=angle)
     if visible_landmarks != "none":
         lines.append(f"- Visible landmarks: {visible_landmarks}.")

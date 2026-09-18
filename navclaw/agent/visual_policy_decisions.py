@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-NAVIGATION_STOP_APPROACH_ACTION_MODES = {"stop", "approach_to_stop"}
-
-
+NAVIGATION_STOP_APPROACH_ACTION_MODES = {
+    "stop",
+    "approach_to_stop",
+    "approach_candidate",
+}
 @dataclass(frozen=True)
 class TaskProgressDecision:
     progress_analysis: str
@@ -21,49 +23,63 @@ class TaskProgressDecision:
     terminal_check_decision: str = ""
     terminal_check_reasoning: str = ""
     terminal_check_missing_constraints: list[str] = field(default_factory=list)
+    # Retain an explicit empty update call without fabricating one for a no-op response.
+    update_progress_called: bool = True
+    standalone_terminal_check: bool = False
 
     def to_dict(self) -> dict[str, object]:
         tool_calls: list[dict[str, object]] = []
         if self.progress_condition_updates:
             tool_calls.append(
                 {
-                    "name": "update_progress_conditions",
+                    "name": "update_predicates",
                     "arguments": {
-                        "condition_updates": [
+                        "predicate_updates": [
                             dict(item) for item in self.progress_condition_updates
                         ]
                     },
                 }
             )
         progress_arguments: dict[str, object] = {
-            "progress_updates": [dict(item) for item in self.progress_updates]
+            "agenda_updates": [dict(item) for item in self.progress_updates]
         }
-        if self.terminal_check_decision.strip():
+        if str(self.terminal_check_decision).strip() != "":
             progress_arguments["terminal_check"] = {
-                "decision": self.terminal_check_decision,
-                "reason": self.terminal_check_reasoning,
-                "missing_constraints": list(self.terminal_check_missing_constraints),
+                "decision": str(self.terminal_check_decision),
+                "missing_constraints": [
+                    str(item) for item in self.terminal_check_missing_constraints
+                ],
             }
-        tool_calls.append(
-            {"name": "update_progress", "arguments": progress_arguments}
-        )
+        if self.update_progress_called or self.progress_updates or (self.terminal_check_decision and not self.standalone_terminal_check):
+            tool_calls.append(
+                {"name": "update_task_state", "arguments": progress_arguments}
+            )
         payload: dict[str, object] = {"tool_calls": tool_calls}
-        if self.progress_analysis.strip():
-            payload["progress_analysis"] = self.progress_analysis
-        if self.progress_reasoning.strip():
-            payload["progress_reasoning"] = self.progress_reasoning
-        if self.route_status.strip():
+        if self.standalone_terminal_check and self.terminal_check_decision:
+            payload["terminal_check"] = progress_arguments["terminal_check"]
+        if str(self.progress_analysis).strip() != "":
+            payload = {"task_state_assessment": str(self.progress_analysis), **payload}
+        if str(self.progress_reasoning).strip() != "":
+            payload["progress_reasoning"] = str(self.progress_reasoning)
+        if str(self.route_status).strip() != "":
             payload.update(
                 {
-                    "route_status": self.route_status,
-                    "route_status_target_index": self.route_status_target_index,
-                    "status_reasoning": self.status_reasoning,
-                    "recovery_reason": self.recovery_reason,
-                    "recovery_anchor_node_id": self.recovery_anchor_node_id,
+                    "route_status": str(self.route_status),
+                    "route_status_target_index": (
+                        None
+                        if self.route_status_target_index is None
+                        else int(self.route_status_target_index)
+                    ),
+                    "status_reasoning": str(self.status_reasoning),
+                    "recovery_reason": str(self.recovery_reason),
+                    "recovery_anchor_node_id": str(self.recovery_anchor_node_id),
                 }
             )
-        if self.retrieval_conclusion.strip():
-            payload = {"retrieval_conclusion": self.retrieval_conclusion, **payload}
+        if str(self.retrieval_conclusion).strip() != "":
+            payload = {
+                "retrieval_conclusion": str(self.retrieval_conclusion),
+                **payload,
+            }
         return payload
 
 
@@ -76,8 +92,13 @@ class NavigationModeDecision:
     reasoning_action: str
     approach_movement: str = ""
     direction: str = ""
+    candidate_angle_deg: int | None = None
     progress_updates: list[dict[str, object]] = field(default_factory=list)
     vertical_direction: str = ""
+    task_item_index: int | None = None
+    subgoal_id: str | None = None
+    subgoal_attempt: int | None = None
+    waypoint_target: str = ""
     route_status: str = "continue_current"
     status_reasoning: str = ""
     recovery_reason: str = ""
@@ -90,44 +111,58 @@ class NavigationModeDecision:
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "action_mode": self.action_mode,
-            "stop_objective": self.stop_objective,
-            "reasoning_action": self.reasoning_action,
-            "direction": self.direction,
-            "vertical_direction": self.vertical_direction,
+            "action_mode": str(self.action_mode),
+            "stop_objective": str(self.stop_objective),
+            "reasoning_action": str(self.reasoning_action),
+            "direction": str(self.direction),
+            "candidate_angle_deg": (
+                None
+                if self.candidate_angle_deg is None
+                else int(self.candidate_angle_deg)
+            ),
+            "vertical_direction": str(self.vertical_direction),
         }
+        if self.action_mode == "vertical_transition" and self.task_item_index is not None:
+            payload["task_item_index"] = self.task_item_index
+        if self.subgoal_id is not None:
+            payload["subgoal_id"] = self.subgoal_id
+            if self.subgoal_attempt is not None:
+                payload["subgoal_attempt"] = self.subgoal_attempt
+        if self.waypoint_target:
+            payload["waypoint_target"] = self.waypoint_target
         if self.progress_updates:
             payload["progress_updates"] = [
                 dict(item) for item in self.progress_updates
             ]
-        if self.progress_analysis.strip():
-            payload["progress_analysis"] = self.progress_analysis
-        if self.progress_reasoning.strip():
-            payload["progress_reasoning"] = self.progress_reasoning
-        if self.action_mode == "approach_to_stop" and self.approach_movement.strip():
-            payload["approach_movement"] = self.approach_movement
-        if self.route_status.strip():
+        if str(self.progress_analysis).strip() != "":
+            payload["progress_analysis"] = str(self.progress_analysis)
+        if str(self.progress_reasoning).strip() != "":
+            payload["progress_reasoning"] = str(self.progress_reasoning)
+        if (
+            str(self.action_mode).strip() == "approach_to_stop"
+            and str(self.approach_movement).strip() != ""
+        ):
+            payload["approach_movement"] = str(self.approach_movement)
+        if str(self.route_status).strip() != "":
             payload.update(
                 {
-                    "route_status": self.route_status,
-                    "status_reasoning": self.status_reasoning,
-                    "recovery_reason": self.recovery_reason,
-                    "recovery_anchor_node_id": self.recovery_anchor_node_id,
+                    "route_status": str(self.route_status),
+                    "status_reasoning": str(self.status_reasoning),
+                    "recovery_reason": str(self.recovery_reason),
+                    "recovery_anchor_node_id": str(self.recovery_anchor_node_id),
                 }
             )
         else:
-            if self.action_objective.strip():
-                payload["action_objective"] = self.action_objective
-            if self.action_reason.strip():
-                payload["action_reason"] = self.action_reason
-            if self.action_mode == "backtrack":
-                payload.update(
-                    {
-                        "backtrack_reason": self.backtrack_reason,
-                        "backtrack_anchor_node_id": self.backtrack_anchor_node_id,
-                        "backtrack_objective": self.backtrack_objective,
-                    }
-                )
+            if str(self.action_objective).strip() != "":
+                payload["action_objective"] = str(self.action_objective)
+            if str(self.action_reason).strip() != "":
+                payload["action_reason"] = str(self.action_reason)
+            if str(self.action_mode).strip() == "backtrack":
+                payload.update({
+                    "backtrack_reason": str(self.backtrack_reason),
+                    "backtrack_anchor_node_id": str(self.backtrack_anchor_node_id),
+                    "backtrack_objective": str(self.backtrack_objective),
+                })
         return payload
 
 
@@ -140,11 +175,38 @@ class LocalMovePlanDecision:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "selected_angle_deg": self.selected_angle_deg,
-            "waypoint_target": self.waypoint_target,
-            "reasoning": self.reasoning,
-            "failure_reason": self.failure_reason,
+            "selected_angle_deg": None if self.selected_angle_deg is None else int(self.selected_angle_deg),
+            "waypoint_target": str(self.waypoint_target),
+            "reasoning": str(self.reasoning),
+            "failure_reason": str(self.failure_reason),
         }
+
+
+@dataclass(frozen=True)
+class ExplorePlannerDecision:
+    frontier_label: int
+    frontier_id: str
+    reasoning: str
+    failure_reason: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "frontier_label": int(self.frontier_label),
+            "frontier_id": str(self.frontier_id),
+            "reasoning": str(self.reasoning),
+        }
+        if str(self.failure_reason).strip() != "":
+            payload["failure_reason"] = str(self.failure_reason)
+        return payload
+
+
+@dataclass(frozen=True)
+class NodeFrontierOverlayPromptImage:
+    node_reference: str
+    frontier_labels: list[int]
+    image_id: str
+    angle_deg: int | None = None
+    obs_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -157,17 +219,13 @@ class VisualActionPointDecision:
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "point_2d": (
-                None
-                if self.point_2d is None
-                else [float(self.point_2d[0]), float(self.point_2d[1])]
-            ),
-            "target": self.target,
-            "reasoning": self.reasoning,
-            "failure_reason": self.failure_reason,
+            "point_2d": None if self.point_2d is None else [float(self.point_2d[0]), float(self.point_2d[1])],
+            "target": str(self.target),
+            "reasoning": str(self.reasoning),
+            "failure_reason": str(self.failure_reason),
         }
-        if self.status.strip():
-            payload = {"status": self.status, **payload}
+        if str(self.status).strip() != "":
+            payload = {"status": str(self.status), **payload}
         return payload
 
 
@@ -180,8 +238,8 @@ class VisualWaypointVerificationDecision:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "verdict": self.verdict,
-            "critique": self.critique,
+            "verdict": str(self.verdict),
+            "critique": str(self.critique),
             "target_not_visible": bool(self.target_not_visible),
             "transition_complete_after_execution": bool(
                 self.transition_complete_after_execution
@@ -197,132 +255,21 @@ class StopConfirmationDecision:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "decision": self.decision,
-            "reasoning": self.reasoning,
-            "continue_objective": self.continue_objective,
+            "decision": str(self.decision),
+            "reasoning": str(self.reasoning),
+            "continue_objective": str(self.continue_objective),
         }
 
 
-def normalize_visual_action_point(
-    payload: dict[str, object],
-) -> VisualActionPointDecision:
-    failure_reason = str(payload.get("failure_reason", "")).strip()
-    point = payload.get("point_2d")
-    point_2d: tuple[float, float] | None = None
-    if not failure_reason:
-        if not isinstance(point, list) or len(point) != 2:
-            raise ValueError(f"visual action requires point_2d length-2 list: {payload!r}")
-        point_2d = (float(point[0]), float(point[1]))
-        if not all(0.0 <= item <= 1.0 for item in point_2d):
-            raise ValueError(f"visual action point_2d outside [0,1]: {payload!r}")
-    return VisualActionPointDecision(
-        point_2d=point_2d,
-        target=str(payload.get("target", "")).strip(),
-        reasoning=str(payload.get("reasoning", "")).strip(),
-        failure_reason=failure_reason,
-    )
-
-
-def normalize_vertical_transition_visual_action_point(
-    payload: dict[str, object],
-) -> VisualActionPointDecision:
-    expected_fields = {
-        "status",
-        "reasoning",
-        "point_2d",
-        "target",
-        "failure_reason",
-    }
-    if set(payload) != expected_fields:
-        raise ValueError(
-            "vertical transition visual action fields must be exactly "
-            f"{sorted(expected_fields)!r}: {payload!r}"
-        )
-    status = str(payload.get("status", "")).strip().lower()
-    reasoning = str(payload.get("reasoning", "")).strip()
-    target = str(payload.get("target", "")).strip()
-    failure_reason = str(payload.get("failure_reason", "")).strip()
-    point = payload.get("point_2d")
-    if status not in {"success", "failure"}:
-        raise ValueError(
-            "vertical transition visual action status must be success or failure: "
-            f"{payload!r}"
-        )
-    if reasoning == "":
-        raise ValueError(
-            f"vertical transition visual action requires reasoning: {payload!r}"
-        )
-    point_2d: tuple[float, float] | None = None
-    if status == "success":
-        if not isinstance(point, list) or len(point) != 2:
-            raise ValueError(
-                "successful vertical transition visual action requires a "
-                f"length-2 point_2d list: {payload!r}"
-            )
-        if any(
-            not isinstance(value, (int, float)) or isinstance(value, bool)
-            for value in point
-        ):
-            raise ValueError(
-                "vertical transition visual action point_2d values must be "
-                f"numbers: {payload!r}"
-            )
-        x, y = float(point[0]), float(point[1])
-        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-            raise ValueError(
-                f"vertical transition visual action point_2d outside [0,1]: {payload!r}"
-            )
-        if target == "" or failure_reason != "":
-            raise ValueError(
-                "successful vertical transition visual action requires a target "
-                f"and empty failure_reason: {payload!r}"
-            )
-        point_2d = (x, y)
-    elif point is not None or target != "" or failure_reason == "":
-        raise ValueError(
-            "failed vertical transition visual action requires point_2d=null, "
-            f"an empty target, and a non-empty failure_reason: {payload!r}"
-        )
-    return VisualActionPointDecision(
-        status=status,
-        point_2d=point_2d,
-        target=target,
-        reasoning=reasoning,
-        failure_reason=failure_reason,
-    )
-
-
-def normalize_visual_waypoint_verification(
-    payload: dict[str, object],
-) -> VisualWaypointVerificationDecision:
-    verdict = str(payload.get("verdict", "")).strip()
-    allowed_verdicts = {"execute", "revise_same_view", "fallback_navigation", "fail"}
-    if verdict not in allowed_verdicts:
-        raise ValueError(f"waypoint verifier returned unsupported verdict: {payload!r}")
-    critique = str(payload.get("critique", "")).strip()
-    if not critique:
-        raise ValueError(f"waypoint verifier requires critique: {payload!r}")
-    return VisualWaypointVerificationDecision(
-        verdict=verdict,
-        critique=critique,
-        target_not_visible=bool(payload.get("target_not_visible", False)),
-        transition_complete_after_execution=bool(
-            payload.get("transition_complete_after_execution", False)
-        ),
-    )
-
-
-def normalize_stop_confirmation(
-    payload: dict[str, object],
-) -> StopConfirmationDecision:
+def normalize_stop_confirmation(payload: dict[str, object]) -> StopConfirmationDecision:
     decision = str(payload.get("decision", "")).strip()
-    if decision not in {"stop", "continue"}:
+    if decision not in {"stop", "continue", "reject_candidate"}:
         raise ValueError(f"stop confirmation returned unsupported decision: {payload!r}")
     reasoning = str(payload.get("reasoning", "")).strip()
-    if not reasoning:
+    if reasoning == "":
         raise ValueError(f"stop confirmation requires reasoning: {payload!r}")
     continue_objective = str(payload.get("continue_objective", "")).strip()
-    if decision == "continue" and not continue_objective:
+    if decision == "continue" and continue_objective == "":
         raise ValueError(f"stop confirmation continue requires continue_objective: {payload!r}")
     return StopConfirmationDecision(
         decision=decision,

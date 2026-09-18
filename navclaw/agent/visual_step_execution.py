@@ -141,6 +141,7 @@ def run_visual_waypoint_decision(
         and decision.navigation_mode.approach_movement == "stay"
         and decision.action_call is None
     ):
+        _mark_selected_subgoal_started(state=state, step=step, navigation_mode=decision.navigation_mode)
         current_node_id = str(step.current_place_node_id)
         reason = str(decision.navigation_mode.reasoning_action)
         pending_stop = {
@@ -205,8 +206,12 @@ def run_visual_waypoint_decision(
         return
 
     if decision.action_call.action == "vertical_transition":
+        decision_payload["task_state_before_action"] = state.system.memory.task_progress.to_dict()
         direction = str(decision.action_call.args.get("direction", "")).strip()
         vertical_args: dict[str, object] = {"direction": direction}
+        for key in ("waypoint_target", "subgoal_id", "subgoal_attempt", "task_context"):
+            if key in decision.action_call.args:
+                vertical_args[key] = decision.action_call.args[key]
         if str(decision.planning_current_node_id).strip() != "":
             vertical_args["planning_node_id"] = str(
                 decision.planning_current_node_id
@@ -237,9 +242,6 @@ def run_visual_waypoint_decision(
 
     if decision.grounded_waypoint_target is not None:
         grounded_target = decision.grounded_waypoint_target
-        frontier_id = str(grounded_target.consume_frontier_id)
-        if frontier_id != "":
-            raise ValueError("canonical VLN waypoints must not consume frontier ids")
         if decision.local_move_plan is None or decision.local_move_plan.selected_angle_deg is None:
             raise ValueError("grounded waypoint requires local_move_plan.selected_angle_deg")
         stop_approach = (
@@ -319,6 +321,19 @@ def run_visual_waypoint_decision(
     apply_agent_feedback(action=agent_action, state=state, step=step)
 
 
+def _mark_selected_subgoal_started(*, state, step, navigation_mode) -> None:
+    if navigation_mode.subgoal_id is None:
+        return
+    task_progress = state.system.memory.task_progress
+    if task_progress.agenda_initialized:
+        item = next((item for item in task_progress.items if item.subgoal_id == navigation_mode.subgoal_id), None)
+        if item is None or item.attempt != navigation_mode.subgoal_attempt:
+            raise ValueError("cannot execute an inactive or stale subgoal attempt")
+        task_progress.mark_subgoal_started(
+            navigation_mode.subgoal_id, str(step.current_place_node_id),
+        )
+
+
 def _execute_visual_action_call(
     *,
     state: "NavClawAgentState",
@@ -327,6 +342,19 @@ def _execute_visual_action_call(
     action_call: ActionCall,
     decision_payload: dict[str, object],
 ) -> None:
+    navigation_mode = decision_payload.get("navigation_mode", {})
+    subgoal_id = navigation_mode.get("subgoal_id") if isinstance(navigation_mode, dict) else None
+    subgoal_attempt = navigation_mode.get("subgoal_attempt") if isinstance(navigation_mode, dict) else None
+    if subgoal_id is not None:
+        task_progress = state.system.memory.task_progress
+        item = next((item for item in task_progress.items if item.subgoal_id == subgoal_id), None)
+        if item is None or item.attempt != subgoal_attempt:
+            raise ValueError("cannot execute an inactive or stale subgoal attempt")
+        task_progress.mark_subgoal_started(subgoal_id, str(step.current_place_node_id))
+        action.args.update({"subgoal_id": subgoal_id, "subgoal_attempt": subgoal_attempt})
+        step.agent_action = action.to_dict()
+        if isinstance(step.agent_decision, dict):
+            step.agent_decision["action"] = action.to_dict()
     segment_timer_started = datetime.now().isoformat()
     result = state.action_executor.execute(action_call)
     step.results = [(action_call, result)]
@@ -346,6 +374,7 @@ def _execute_visual_action_call(
     step.executed_action = {
         "type": "move_to_visual_waypoint",
         "route_completed": bool(result.ok),
+        **({"subgoal_id": subgoal_id, "subgoal_attempt": subgoal_attempt} if subgoal_id is not None else {}),
         "origin_place_node_id": str(step.current_place_node_id),
         "decision": deepcopy(decision_payload),
         "move_call": action_call.to_dict(),
@@ -388,6 +417,8 @@ def _execute_visual_action_call(
             reason=str(action.reason),
             move_mode=move_mode,
             backtrack_reference_node_id=backtrack_reference_node_id,
+            subgoal_id=subgoal_id,
+            subgoal_attempt=subgoal_attempt,
             backtrack_contexts=[
                 deepcopy(item)
                 for item in backtrack_contexts

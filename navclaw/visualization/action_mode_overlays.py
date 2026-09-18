@@ -18,6 +18,7 @@ from navclaw.mapping.exploration.bev_visuals import (
     place_node_marker_style,
 )
 from navclaw.types import LocalmapFrontierRecord
+from navclaw.visualization.trajectory import edge_display_path_xy as _edge_display_path_xy
 
 if TYPE_CHECKING:
     from navclaw.graph.graph import Graph
@@ -483,38 +484,6 @@ def _place_node_marker_specs(
         center = _xy_to_px(global_exploration, node.position[:2])
         specs.append((center, str(label), BEV_PLACE_NODE_FILL))
     return specs
-
-
-def _edge_display_path_xy(
-    *,
-    edge: object,
-    src_xy: tuple[float, float] | list[float],
-    dst_xy: tuple[float, float] | list[float],
-) -> list[tuple[float, float]]:
-    src = (float(src_xy[0]), float(src_xy[1]))
-    dst = (float(dst_xy[0]), float(dst_xy[1]))
-    path: list[tuple[float, float]] = []
-    for point in list(getattr(edge, "path_xy", [])):
-        if not isinstance(point, (list, tuple)) or len(point) != 2:
-            continue
-        xy = (float(point[0]), float(point[1]))
-        if path != [] and _same_xy(path[-1], xy):
-            continue
-        path.append(xy)
-    if path == []:
-        return [src, dst]
-    if not _same_xy(path[0], src):
-        path.insert(0, src)
-    if not _same_xy(path[-1], dst):
-        path.append(dst)
-    return path
-
-
-def _same_xy(left: tuple[float, float], right: tuple[float, float]) -> bool:
-    return (
-        round(float(left[0]), 4) == round(float(right[0]), 4)
-        and round(float(left[1]), 4) == round(float(right[1]), 4)
-    )
 
 
 def _render_scaled_overlay(

@@ -18,13 +18,11 @@ from navclaw.agent.vln_landmark_context import _global_landmark_index
 from navclaw.agent.visual_policy_prompt_images import image_content_for_array
 from navclaw.agent.visual_policy_prompt_images import image_content_for_current_panorama_views
 from navclaw.agent.visual_policy_prompt_images import image_content_for_movement_history_sheet
-from navclaw.mapping.exploration.bev_visuals import place_node_marker_style
-from navclaw.mapping.exploration.manager import _densify_path_xy
-from navclaw.mapping.exploration.manager import _project_points
-from navclaw.mapping.exploration.overlay_drawing import RGB_TRAJECTORY_WIDTH
+from navclaw.llm.image_preprocessing import LLM_CAMERA_IMAGE_MAX_SIZE, resize_rgb_to_fit
+from navclaw.mapping.exploration.manager import project_visible_trajectory
 from navclaw.mapping.exploration.overlay_drawing import _draw_place_node_circle
 from navclaw.visualization.action_mode_overlays import BevOverlayTransform
-from navclaw.visualization.action_mode_overlays import _edge_display_path_xy
+from navclaw.visualization.trajectory import edge_display_path_xyz, draw_rgb_trajectory
 from navclaw.visualization.action_mode_overlays import render_task_progress_bev_overlay_result
 from navclaw.visualization.action_mode_overlays import _node_labels_by_id
 
@@ -72,17 +70,23 @@ class RetrieveRequest:
     retrieval_conclusion: str = ""
     progress_condition_updates: tuple[dict[str, object], ...] = ()
     already_provided_items: tuple["RetrieveItem", ...] = ()
+    progress_analysis: str = ""
+    progress_updates: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
             "query": str(self.query),
             "items": [item.to_dict() for item in self.items],
-            "progress_condition_updates": [
+            "predicate_updates": [
                 deepcopy(item) for item in self.progress_condition_updates
             ],
         }
         if str(self.retrieval_conclusion).strip() != "":
             payload["retrieval_conclusion"] = str(self.retrieval_conclusion)
+        if str(self.progress_analysis).strip() != "":
+            payload["task_state_assessment"] = str(self.progress_analysis)
+        if self.progress_updates:
+            payload["agenda_updates"] = [deepcopy(item) for item in self.progress_updates]
         if self.already_provided_items:
             payload["already_provided_items"] = [
                 item.to_dict() for item in self.already_provided_items
@@ -98,7 +102,7 @@ class RetrieveRound:
     conclusion: str = ""
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "round_index": int(self.round_index),
             "query": str(self.request.query),
             "items": [item.to_dict() for item in self.request.items],
@@ -107,11 +111,16 @@ class RetrieveRound:
             ],
             "source_obs_ids": [str(obs_id) for obs_id in self.source_obs_ids],
             "conclusion": str(self.conclusion),
-            "progress_condition_updates": [
+            "predicate_updates": [
                 deepcopy(item)
                 for item in self.request.progress_condition_updates
             ],
         }
+        if str(self.request.progress_analysis).strip() != "":
+            payload["task_state_assessment"] = str(self.request.progress_analysis)
+        if self.request.progress_updates:
+            payload["agenda_updates"] = [deepcopy(item) for item in self.request.progress_updates]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -601,6 +610,8 @@ def execute_retrieve_request(
             items=request.items,
             already_provided_items=request.already_provided_items,
             progress_condition_updates=request.progress_condition_updates,
+            progress_analysis=request.progress_analysis,
+            progress_updates=request.progress_updates,
         ),
         source_obs_ids=tuple(source_obs_ids),
     )
@@ -1022,8 +1033,9 @@ def _add_edge_rgb_panel(
         key=key,
         label=(
             f"Retrieved edge {edge.id} start-view RGB from {src_node.id} toward "
-            f"{dst_node.id}; the blue line is the executed path and the numbered "
-            "node marker is the endpoint."
+            f"{dst_node.id}; the blue curve is the executed path, smoothed for display. "
+            "Arrows show travel from start to endpoint; the numbered node marker is "
+            "the endpoint. Only visible path segments are drawn."
         ),
         content=(image_content_for_array(image),),
         source_obs_ids=(str(obs_id),),
@@ -1038,37 +1050,28 @@ def _render_edge_rgb_overlay(
     src_node,
     dst_node,
 ) -> tuple[str, np.ndarray] | None:
-    display_path_xy = _edge_display_path_xy(
-        edge=edge,
-        src_xy=src_node.position[:2],
-        dst_xy=dst_node.position[:2],
-    )
-    path_xy = _densify_path_xy(display_path_xy)
-    if len(path_xy) < 2:
+    if len(edge.path_xy) < 2:
         return None
-    path_z = _interpolated_edge_path_z(
-        path_xy=path_xy,
-        src_z=float(src_node.position[2]),
-        dst_z=float(dst_node.position[2]),
+    path_xyz = edge_display_path_xyz(
+        edge=edge, src_node=src_node, dst_node=dst_node,
     )
-    path_xyz = np.column_stack([path_xy, path_z]).astype(np.float32)
     selected: tuple[tuple[float, int], str, np.ndarray, np.ndarray] | None = None
     for obs_id in src_node.obs_ids:
         observation = state.cache.get_observation(str(obs_id)).observation
         if (
             observation.rgb is None
+            or observation.depth is None
             or observation.intrinsics is None
             or observation.T_cam_odom is None
         ):
             continue
-        rgb = np.asarray(observation.rgb, dtype=np.uint8)
+        rgb = resize_rgb_to_fit(
+            observation.rgb, max_size=LLM_CAMERA_IMAGE_MAX_SIZE,
+        ).image
         image_height, image_width = rgb.shape[:2]
-        projected, _depths, valid = _project_points(
-            points_odom=path_xyz,
-            T_cam_odom=np.asarray(observation.T_cam_odom, dtype=np.float32),
-            intrinsics=np.asarray(observation.intrinsics, dtype=np.float32),
-            image_width=image_width,
-            image_height=image_height,
+        projected, valid = project_visible_trajectory(
+            observation=observation, path_xyz=path_xyz,
+            image_size=(image_width, image_height),
         )
         if not bool(valid[-1]):
             continue
@@ -1087,21 +1090,9 @@ def _render_edge_rgb_overlay(
     projected = projection_with_valid[:, :2]
     valid = projection_with_valid[:, 2].astype(bool)
     image = Image.fromarray(rgb).convert("RGBA")
-    trajectory_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    trajectory_draw = ImageDraw.Draw(trajectory_layer, "RGBA")
-    node_style = place_node_marker_style(
-        image_width=int(image.size[0]),
-        image_height=int(image.size[1]),
-        mode="rgb",
+    draw_rgb_trajectory(
+        draw=ImageDraw.Draw(image, "RGBA"), projected=projected, valid=valid,
     )
-    for run in _contiguous_projected_runs(projected=projected, valid=valid):
-        trajectory_draw.line(
-            run,
-            fill=node_style.fill,
-            width=RGB_TRAJECTORY_WIDTH,
-            joint="curve",
-        )
-    image.alpha_composite(trajectory_layer)
     _draw_place_node_circle(
         draw=ImageDraw.Draw(image, "RGBA"),
         center_xy=(float(projected[-1, 0]), float(projected[-1, 1])),
@@ -1111,42 +1102,6 @@ def _render_edge_rgb_overlay(
         image=image,
     )
     return obs_id, np.asarray(image.convert("RGB"), dtype=np.uint8)
-
-
-def _interpolated_edge_path_z(
-    *,
-    path_xy: np.ndarray,
-    src_z: float,
-    dst_z: float,
-) -> np.ndarray:
-    segment_lengths = np.linalg.norm(np.diff(path_xy, axis=0), axis=1)
-    cumulative = np.concatenate(
-        [np.zeros((1,), dtype=np.float32), np.cumsum(segment_lengths, dtype=np.float32)]
-    )
-    total = float(cumulative[-1])
-    if total <= 1e-6:
-        return np.full((len(path_xy),), float(src_z), dtype=np.float32)
-    ratios = cumulative / total
-    return np.asarray(float(src_z) + ratios * (float(dst_z) - float(src_z)), dtype=np.float32)
-
-
-def _contiguous_projected_runs(
-    *,
-    projected: np.ndarray,
-    valid: np.ndarray,
-) -> list[list[tuple[float, float]]]:
-    runs: list[list[tuple[float, float]]] = []
-    current: list[tuple[float, float]] = []
-    for point, is_valid in zip(projected, valid):
-        if bool(is_valid):
-            current.append((float(point[0]), float(point[1])))
-            continue
-        if len(current) >= 2:
-            runs.append(current)
-        current = []
-    if len(current) >= 2:
-        runs.append(current)
-    return runs
 
 
 def _annotated_landmark_images(

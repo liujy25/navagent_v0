@@ -1,21 +1,26 @@
 # NavAgent v0
 
-NavAgent v0 is the robot-facing release of the canonical NavClaw visual
+NavAgent v0 is the standalone robot-facing release of the NavProbe visual
 language navigation (VLN) agent. It contains one algorithm configuration:
 
-- independent task-progress updating and progress-conditioned navigation;
-- active episodic retrieval with up to eight rounds per place step;
+- a Task Executive with a mutable agenda, stable objective IDs, and attempt history;
+- active entity-field retrieval with up to six rounds per place step;
 - entity knowledge consolidation after retrieval;
-- virtual planning-reference backtracking and TPU-owned terminal checks;
+- virtual planning-reference backtracking and Executive-owned terminal checks;
 - Frontier Skeleton Sampling (FSS) waypoint grounding from RGB-D;
-- multi-floor vertical-transition handling;
+- observation-grounded stair FSS and local vertical movements;
 - YOLO-World landmark detection.
 
-The prompt/runtime contracts match the current NavClaw mainline: strict initial
-progress items, TPU ordered `tool_calls`, direction-bearing PCNP actions, fixed
-action grounding by the Waypoint Planner, round-aligned EKM traces, and explicit
-vertical-grounding success/failure responses. The raw instruction is used only
-for initialization; later planning uses maintained progress state.
+The algorithm is synchronized to NavProbe commit `f26d5a1` (2026-09-18), while
+retaining this repository's robot interfaces. The original instruction remains
+available to the Executive and semantic skill selector. The waypoint grounder
+receives a self-contained selected skill and candidate evidence. Task updates
+use the native agenda/predicate protocol and commit atomically; an empty agenda
+does not establish task completion.
+
+This repository does not import or require the sibling NavProbe repository.
+Future changes there do not change this installed agent. See
+[MIGRATION.md](MIGRATION.md) for the synchronization boundary and validation.
 
 It intentionally excludes Habitat/HM3D/R2R evaluation runners, experiment
 ablations, replay tools, batch launchers, web viewers, and raw prompt/response

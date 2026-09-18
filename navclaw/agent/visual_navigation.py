@@ -19,7 +19,6 @@ from navclaw.agent.visual_action_context import VisualActionContext, VisualViewC
 from navclaw.agent.visual_action_context import build_visual_action_context_for_node
 from navclaw.agent.visual_action_context import direction_for_angle
 from navclaw.agent.visual_grounding import VisualWaypoint
-from navclaw.agent.visual_policy import decide_stop_confirmation
 from navclaw.agent.visual_policy import decide_vln_navigation_step
 from navclaw.agent.visual_policy import decide_vln_task_progress_step
 from navclaw.agent.visual_policy import ensure_task_progress_memory
@@ -34,22 +33,21 @@ from navclaw.agent.vln_waypoint_policy import plan_vln_waypoint_loop
 from navclaw.agent.vln_waypoint_sampling import VLN_STOP_WAYPOINT_MAX_DISTANCE_M
 from navclaw.agent.vln_waypoint_sampling import VLN_STOP_WAYPOINT_SAMPLE_SPACING_M
 from navclaw.agent.vln_waypoint_sampling import VLN_WAYPOINT_GLOBAL_NODE_DEDUP_RADIUS_M
+from navclaw.agent.waypoint import FunctionWaypointPolicy
 from navclaw.agent.waypoint import GroundedWaypointTarget
 from navclaw.agent.waypoint import WaypointPlanningContext
 from navclaw.agent.waypoint import WaypointPolicyOutput
+from navclaw.agent.waypoint import WaypointPolicyRegistry
 from navclaw.agent.waypoint import WaypointPolicyResult
 from navclaw.agent.waypoint.types import FRONTIER_SKELETON_SAMPLE_WAYPOINT_POLICY
+from navclaw.agent.waypoint.types import validate_waypoint_policy
 from navclaw.graph.node import add_node_observation_knowledge
 from navclaw.graph.node import has_node_observation_knowledge
 from navclaw.memory.task_progress import TaskProgressUpdateResult
+from navclaw.perception.goal_identity import GOAL_KIND_OBJECT_CATEGORY
 from navclaw.perception.goal_identity import GOAL_KIND_VLN_INSTRUCTION
 from navclaw.schemas import ActionCall
-from navclaw.types import LocalmapNavigationPlan, LocalmapRouteTarget
-from navclaw.visualization.action_mode_overlays import (
-    BevOverlayTransform,
-    _node_labels_by_id,
-    render_task_progress_bev_overlay_result,
-)
+from navclaw.visualization.action_mode_overlays import BevOverlayTransform, _node_labels_by_id, render_task_progress_bev_overlay_result
 from navclaw.visualization.waypoint_overlay import draw_waypoint_overlay_rgb
 
 if TYPE_CHECKING:
@@ -58,7 +56,6 @@ if TYPE_CHECKING:
     from navclaw.perception.goal import GoalSpec
 
 
-VISUAL_WAYPOINT_VERIFICATION_MAX_ATTEMPTS = 4
 NAVIGATION_REPLAN_MAX_ATTEMPTS = 2
 NEED_MORE_EVIDENCE_WARNING_CONSECUTIVE_COUNT = 3
 
@@ -97,12 +94,11 @@ class VisualNavigationDecision:
     task_progress_initialization: dict[str, object]
     navigation_mode: NavigationModeDecision | None
     task_progress_update_result: TaskProgressUpdateResult
+    verify_memory_update_result: dict[str, object]
     visual_action: VisualActionPointDecision | None
     waypoint: VisualWaypoint | None
     action_call: ActionCall | None
     local_move_plan: LocalMovePlanDecision | None = None
-    route_target: LocalmapRouteTarget | None = None
-    navigation_plan: LocalmapNavigationPlan | None = None
     waypoint_attempts: list[VisualWaypointAttempt] = field(default_factory=list)
     navigation_replan_feedback: list[dict[str, object]] = field(default_factory=list)
     failure_reason: str = ""
@@ -122,12 +118,11 @@ class VisualNavigationDecision:
                 None if self.navigation_mode is None else self.navigation_mode.to_dict()
             ),
             "task_progress_update_result": self.task_progress_update_result.to_dict(),
+            "verify_memory_update_result": deepcopy(self.verify_memory_update_result),
             "visual_action": None if self.visual_action is None else self.visual_action.to_dict(),
             "waypoint": None if self.waypoint is None else self.waypoint.to_dict(),
             "action_call": None if self.action_call is None else self.action_call.to_dict(),
             "local_move_plan": None if self.local_move_plan is None else self.local_move_plan.to_dict(),
-            "route_target": None if self.route_target is None else self.route_target.to_dict(),
-            "navigation_plan": None if self.navigation_plan is None else self.navigation_plan.to_dict(),
             "waypoint_attempts": [attempt.to_dict() for attempt in self.waypoint_attempts],
             "navigation_replan_feedback": [dict(item) for item in self.navigation_replan_feedback],
             "failure_reason": str(self.failure_reason),
@@ -158,6 +153,7 @@ class EpisodicRetrievalLoopResult:
     planning_visual_context: VisualActionContext | None = None
     backtrack_contexts: list[dict[str, object]] = field(default_factory=list)
     failure_reason: str = ""
+    progress_update_history: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -224,22 +220,6 @@ def ensure_current_node_summary_for_visual_policy(
     )
 
 
-def recent_outcome_text(state: "NavClawAgentState") -> str:
-    action = getattr(state, "last_executed_action", None)
-    if not isinstance(action, dict):
-        return "none"
-    summary = {
-        "type": action.get("type"),
-        "route_completed": action.get("route_completed"),
-        "execution": action.get("execution"),
-    }
-    if isinstance(action.get("move_result"), dict):
-        result = dict(action["move_result"])
-        summary["move_ok"] = result.get("ok")
-        summary["move_message"] = result.get("message")
-    return json.dumps(summary, ensure_ascii=False)
-
-
 def _node_summary_payload(
     *,
     node_id: str,
@@ -259,14 +239,20 @@ def _node_summary_payload(
     }
 
 
+def _task_type(goal: "GoalSpec | None") -> str:
+    if goal is None:
+        return "navigation"
+    goal_kind = str(getattr(goal, "goal_kind", "") or "").strip()
+    if goal_kind != "":
+        return goal_kind
+    goal_type = str(getattr(goal, "goal_type", "") or "").strip()
+    return goal_type if goal_type != "" else "navigation"
 
 
 def _goal_kind(goal: "GoalSpec | None") -> str:
     if goal is None:
         return ""
     return str(getattr(goal, "goal_kind", "") or "").strip()
-
-
 
 
 def _task_progress_overlay_robot_xy(visual_context: VisualActionContext) -> tuple[float, float] | None:
@@ -289,30 +275,6 @@ def _task_progress_overlay_robot_yaw_deg(visual_context: VisualActionContext) ->
     return float(pose["yaw"])
 
 
-def _progress_updates_for_goal(
-    raw_updates: list[dict[str, object]],
-    *,
-    goal: "GoalSpec | None",
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    filtered_updates: list[dict[str, object]] = []
-    skipped_updates: list[dict[str, object]] = []
-    for update in raw_updates:
-        if str(update.get("kind", "")).strip().lower() == "verify_candidate":
-            skipped_updates.append(
-                {
-                    "reason": "verify_candidate_removed_from_task_progress",
-                    "update": deepcopy(update),
-                }
-            )
-            continue
-        sanitized_update = deepcopy(update)
-        sanitized_update.pop("candidate", None)
-        filtered_updates.append(sanitized_update)
-    return filtered_updates, skipped_updates
-
-
-
-
 def _navigation_replan_feedback_text(feedback: list[dict[str, object]]) -> str:
     if feedback == []:
         return ""
@@ -321,6 +283,8 @@ def _navigation_replan_feedback_text(feedback: list[dict[str, object]]) -> str:
         fields = [f"action_mode={item.get('action_mode', '')}"]
         for output_name, input_name in (
             ("reference_node_id", "reference_node_id"),
+            ("task_item_index", "task_item_index"),
+            ("completion_evidence", "completion_evidence"),
             ("stop_objective", "stop_objective"),
             ("waypoint_target", "waypoint_target"),
             ("validation_result", "verifier_verdict"),
@@ -357,27 +321,6 @@ def _navigation_replan_feedback_text(feedback: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def _fallback_navigation_feedback(
-    *,
-    navigation_mode: NavigationModeDecision,
-    local_move_plan: LocalMovePlanDecision,
-    selected_view: VisualViewContext,
-    waypoint_target: str,
-    verification: VisualWaypointVerificationDecision,
-) -> dict[str, object]:
-    return {
-        "action_mode": str(navigation_mode.action_mode),
-        "stop_objective": str(navigation_mode.stop_objective),
-        "selected_direction": direction_for_angle(selected_view.angle_deg),
-        "selected_obs_id": str(selected_view.obs_id),
-        "waypoint_target": str(waypoint_target),
-        "local_move_reasoning": str(local_move_plan.reasoning),
-        "verifier_verdict": str(verification.verdict),
-        "target_not_visible": bool(verification.target_not_visible),
-        "failure_summary": str(verification.critique),
-    }
-
-
 def _with_replan_log(
     decision: VisualNavigationDecision,
     *,
@@ -394,10 +337,6 @@ def _with_replan_log(
             *[dict(item) for item in decision.navigation_replan_feedback],
         ],
     )
-
-
-
-
 
 
 def _need_more_evidence_warning_text(state: "NavClawAgentState") -> str:
@@ -443,27 +382,18 @@ def _vln_initial_progress_note(*, goal_kind: str, step_index: int) -> str:
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def episodic_retrieval_enabled_for_goal(
+    *, state: "NavClawAgentState", goal: "GoalSpec | None",
+) -> bool:
+    return (
+        _goal_kind(goal) in {GOAL_KIND_VLN_INSTRUCTION, GOAL_KIND_OBJECT_CATEGORY}
+    )
 
 
 def _uses_system_active_waypoint_grounding(
-    *,
-    goal_kind: str,
+    *, goal_kind: str,
 ) -> bool:
-    return str(goal_kind) == GOAL_KIND_VLN_INSTRUCTION
+    return goal_kind in {GOAL_KIND_VLN_INSTRUCTION, GOAL_KIND_OBJECT_CATEGORY}
 
 
 def _vln_backtrack_node_ids(
@@ -479,18 +409,6 @@ def _vln_backtrack_node_ids(
         and str(node.node_kind) == "place"
         and list(node.obs_ids) != []
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _vln_backtrack_context(
@@ -545,11 +463,10 @@ def _vln_waypoint_inherited_agent_context(
     context_loop: EpisodicRetrievalLoopResult | None,
     task_progress: TaskProgressDecision,
     navigation_mode: NavigationModeDecision,
-    active_progress_item: str = "",
     task_progress_text: str = "",
+    original_instruction: str | None = None,
+    dynamic_agenda: bool = False,
 ) -> list[dict[str, object]]:
-    active_item = str(active_progress_item).strip()
-    progress = context_loop.task_progress_decision if context_loop is not None else task_progress
     navigation_action: dict[str, object] = {
         "mode": str(navigation_mode.action_mode),
     }
@@ -576,19 +493,25 @@ def _vln_waypoint_inherited_agent_context(
         navigation_action["vertical_direction"] = str(
             navigation_mode.vertical_direction
         )
+    if getattr(navigation_mode, "subgoal_id", None) is not None:
+        navigation_action["subgoal_id"] = navigation_mode.subgoal_id
+        navigation_action["subgoal_attempt"] = navigation_mode.subgoal_attempt
+    if getattr(navigation_mode, "waypoint_target", ""):
+        navigation_action["waypoint_target"] = navigation_mode.waypoint_target
+    if dynamic_agenda:
+        return [{
+            "type": "text",
+            "text": "Selected skill and local intent:\n"
+            + json.dumps(navigation_action, ensure_ascii=False),
+        }]
+    progress = context_loop.task_progress_decision if context_loop is not None else task_progress
     progress_memory = str(task_progress_text).strip()
     progress_memory_section = (
-        f"Current progress:\n{progress_memory}\n"
-        if progress_memory != ""
-        else ""
+        f"Original navigation instruction:\n{original_instruction}\n"
+        if original_instruction is not None else ""
     )
-    active_item_section = (
-        "Active item and its read-only grounding conditions:\n"
-        f"{active_item}\n"
-        "An unconfirmed condition remains unresolved and is not an established fact.\n"
-        if active_item != ""
-        else ""
-    )
+    if progress_memory:
+        progress_memory_section += f"Current progress:\n{progress_memory}\n"
     retrieval_section = ""
     if context_loop is not None and context_loop.workspace.rounds != []:
         retrieval_section = (
@@ -607,10 +530,18 @@ def _vln_waypoint_inherited_agent_context(
             _vln_backtrack_context_text(context_backtrack_contexts) + "\n"
         )
     progress_updates_section = ""
-    if progress.progress_updates:
+    progress_analysis_section = ""
+    if str(progress.progress_analysis).strip() != "":
+        progress_analysis_section = (
+            "Latest Task Executive assessment:\n" + progress.progress_analysis + "\n"
+        )
+    progress_updates = (
+        getattr(context_loop, "progress_update_history", []) or progress.progress_updates
+    )
+    if progress_updates:
         progress_updates_section = (
             "Progress updates:\n"
-            + json.dumps(progress.progress_updates, ensure_ascii=False, indent=2)
+            + json.dumps(progress_updates, ensure_ascii=False, indent=2)
             + "\n"
         )
     content: list[dict[str, object]] = [
@@ -621,9 +552,9 @@ def _vln_waypoint_inherited_agent_context(
                 f"{json.dumps(navigation_action, ensure_ascii=False)}\n\n"
                 "Navigation state:\n"
                 f"{progress_memory_section}"
-                f"{active_item_section}"
                 f"{retrieval_section}"
                 f"{backtrack_section}"
+                f"{progress_analysis_section}"
                 f"{progress_updates_section}"
             ),
         }
@@ -631,8 +562,19 @@ def _vln_waypoint_inherited_agent_context(
     return content
 
 
-def _current_active_task_progress_item(task_progress_memory) -> str:
+def _bind_navigation_subgoal(decision: NavigationModeDecision, task_progress_memory) -> NavigationModeDecision:
+    if not task_progress_memory.agenda_initialized or decision.subgoal_id is None:
+        return decision
+    item = next((item for item in task_progress_memory.items if item.subgoal_id == decision.subgoal_id), None)
+    if item is None:
+        raise ValueError(f"navigation selected inactive subgoal: {decision.subgoal_id}")
+    return replace(decision, subgoal_attempt=item.attempt)
+
+
+def _current_active_task_progress_item(task_progress_memory, subgoal_id: str | None = None) -> str:
     for item in list(task_progress_memory.items):
+        if subgoal_id is not None and item.subgoal_id != subgoal_id:
+            continue
         if str(item.status) == "active" and str(item.kind) == "task":
             content = str(item.content).strip()
             unconfirmed = [
@@ -792,6 +734,10 @@ def run_episodic_retrieval_loop(
 ) -> EpisodicRetrievalLoopResult:
     goal_kind = _goal_kind(goal)
     task_progress_memory = state.system.memory.task_progress
+    instruction_context = {
+        "original_instruction": goal_text,
+    }
+    memory_context_mode = "active_retrieval"
     physical_visual_context = visual_context
     planning_visual_context = visual_context
     planning_landmark_context = vln_landmark_context
@@ -806,9 +752,6 @@ def run_episodic_retrieval_loop(
     if pending_initialization is not None:
         task_progress_initialization = dict(pending_initialization)
         setattr(state, "pending_vln_task_progress_initialization", None)
-        task_progress_memory.ensure_current_task_started(
-            str(planning_visual_context.current_node_id)
-        )
     else:
         task_progress_initialization = ensure_task_progress_memory(
             client=state.llm_client,
@@ -841,7 +784,7 @@ def run_episodic_retrieval_loop(
             client=state.llm_client,
             state=state,
             workspace=workspace,
-            current_node_id=str(planning_visual_context.current_node_id),
+            current_node_id=str(physical_visual_context.current_node_id),
             progress_updates=progress_update_history,
         )
         knowledge_management_complete = True
@@ -864,7 +807,8 @@ def run_episodic_retrieval_loop(
         payload["backtrack_contexts"] = [
             deepcopy(item) for item in backtrack_contexts
         ]
-        payload["memory_context_mode"] = "active_retrieval"
+        payload["memory_context_mode"] = memory_context_mode
+        payload["knowledge_consolidation_enabled"] = True
         if task_progress_decision is not None:
             payload["final_progress_update"] = task_progress_decision.to_dict()
         if progress_update_history != []:
@@ -940,6 +884,7 @@ def run_episodic_retrieval_loop(
             and len(backtrack_contexts) < int(NAVIGATION_REPLAN_MAX_ATTEMPTS)
             else set()
         )
+        require_backtrack = False
         allow_retrieve = (
             not progress_is_current
             and int(step.place_step_index) > 0
@@ -951,17 +896,13 @@ def run_episodic_retrieval_loop(
             if not progress_is_current
             else workspace.conclusion_context_content()
         ) if workspace.rounds != [] else []
-        backtrack_context_text = _vln_backtrack_context_text(backtrack_contexts)
-        progress_context_text = "\n\n".join(
-            item
-            for item in (
-                _vln_initial_progress_note(
-                    goal_kind=goal_kind,
-                    step_index=int(step.place_step_index),
-                ),
-            )
-            if item != ""
+        backtrack_context_text = _vln_backtrack_context_text(
+            backtrack_contexts
         )
+        progress_context_text = _vln_initial_progress_note(
+            goal_kind=goal_kind, step_index=int(step.place_step_index),
+        )
+        task_progress_bev_overlay = None
         planning_reference_panorama = (
             str(planning_visual_context.current_node_id)
             != str(physical_visual_context.current_node_id)
@@ -978,19 +919,20 @@ def run_episodic_retrieval_loop(
                 visual_context=planning_visual_context,
                 task_progress=task_progress_memory,
                 latest_task_progress=task_progress_decision,
+                **instruction_context,
                 retrieval_workspace_content=retrieval_context_content,
                 progress_context_text=progress_context_text,
                 backtrack_context_text=backtrack_context_text,
                 landmark_panorama_views=landmark_panorama_views,
                 detected_landmarks_text=detected_landmarks_text,
                 allowed_backtrack_node_ids=allowed_backtrack_node_ids,
-                require_backtrack=False,
+                require_backtrack=require_backtrack,
                 system_owned_waypoint_objective=(
                     _uses_system_active_waypoint_grounding(
                         goal_kind=_goal_kind(goal),
                     )
                 ),
-                task_progress_bev_overlay=None,
+                task_progress_bev_overlay=task_progress_bev_overlay,
                 planning_reference_panorama=planning_reference_panorama,
             )
         else:
@@ -1000,16 +942,10 @@ def run_episodic_retrieval_loop(
                 goal_kind=goal_kind,
                 visual_context=planning_visual_context,
                 task_progress=task_progress_memory,
-                memory_index_text=loop_index_text if allow_retrieve else "",
+                memory_index_text=loop_index_text,
                 retrieval_workspace_content=retrieval_context_content,
-                retrieve_max_rounds=(
-                    int(workspace.max_retrieve_rounds)
-                    if allow_retrieve
-                    else 0
-                ),
-                retrieve_completed_rounds=(
-                    int(workspace.retrieve_count) if allow_retrieve else 0
-                ),
+                retrieve_max_rounds=int(workspace.max_retrieve_rounds),
+                retrieve_completed_rounds=int(workspace.retrieve_count),
                 retrieve_fields_by_ref=(
                     loop_fields_by_ref if allow_retrieve else {}
                 ),
@@ -1018,7 +954,9 @@ def run_episodic_retrieval_loop(
                 ),
                 allow_retrieve=allow_retrieve,
                 allow_update_progress=True,
+                **instruction_context,
                 require_retrieval_conclusion=workspace.has_pending_evidence,
+                memory_index_context_only=False,
                 progress_context_text=progress_context_text,
                 backtrack_context_text=backtrack_context_text,
                 landmark_panorama_views=landmark_panorama_views,
@@ -1026,67 +964,34 @@ def run_episodic_retrieval_loop(
                 terminal_check_context=(
                     pending_terminal_check if terminal_check_required else None
                 ),
-                task_progress_bev_overlay=None,
+                task_progress_bev_overlay=task_progress_bev_overlay,
                 planning_reference_panorama=planning_reference_panorama,
             )
-        if isinstance(decision, RetrieveRequest):
-            condition_update_result = task_progress_memory.apply_condition_updates(
+        if isinstance(decision, (RetrieveRequest, TaskProgressDecision)):
+            if workspace.has_pending_evidence:
+                workspace.conclude_latest_retrieval(decision.retrieval_conclusion)
+            committed_updates = task_progress_memory.apply_agenda_updates(
+                list(decision.progress_updates),
                 list(decision.progress_condition_updates),
-                current_node_id=str(planning_visual_context.current_node_id),
+                current_node_id=str(physical_visual_context.current_node_id),
             )
-            task_progress_update_result.applied_updates.extend(
-                condition_update_result.applied_updates
-            )
-            task_progress_update_result.skipped_updates.extend(
-                condition_update_result.skipped_updates
-            )
-            if workspace.has_pending_evidence:
-                workspace.conclude_latest_retrieval(decision.retrieval_conclusion)
-                workspace.discard_concluded_raw_evidence()
-            execute_retrieve_request(
-                state=state,
-                workspace=workspace,
-                request=decision,
-            )
-            progress_is_current = False
-            update_step_trace()
-            continue
-        if isinstance(decision, TaskProgressDecision):
-            if workspace.has_pending_evidence:
-                workspace.conclude_latest_retrieval(decision.retrieval_conclusion)
-            progress_updates, skipped_progress_updates = _progress_updates_for_goal(
-                decision.progress_updates,
-                goal=goal,
-            )
-            item_update_result = task_progress_memory.apply_updates(
-                progress_updates,
-                current_node_id=str(planning_visual_context.current_node_id),
-            )
-            task_progress_update_result.applied_updates.extend(
-                item_update_result.applied_updates
-            )
-            task_progress_update_result.skipped_updates.extend(
-                item_update_result.skipped_updates
-            )
-            task_progress_update_result.skipped_updates.extend(skipped_progress_updates)
-            condition_update_result = task_progress_memory.apply_condition_updates(
-                decision.progress_condition_updates,
-                current_node_id=str(planning_visual_context.current_node_id),
-            )
-            task_progress_update_result.applied_updates.extend(
-                condition_update_result.applied_updates
-            )
-            task_progress_update_result.skipped_updates.extend(
-                condition_update_result.skipped_updates
-            )
-            task_progress_decision = decision
-            progress_update_history.extend(
-                deepcopy(item) for item in decision.progress_updates
-            )
+            task_progress_update_result.applied_updates.extend(committed_updates.applied_updates)
+            task_progress_update_result.skipped_updates.extend(committed_updates.skipped_updates)
+            progress_update_history.extend(deepcopy(committed_updates.applied_updates))
             progress_update_count += 1
-            progress_is_current = True
             if workspace.rounds != []:
                 workspace.discard_concluded_raw_evidence()
+            if isinstance(decision, RetrieveRequest):
+                execute_retrieve_request(
+                    state=state,
+                    workspace=workspace,
+                    request=decision,
+                )
+                progress_is_current = False
+                update_step_trace()
+                continue
+            task_progress_decision = decision
+            progress_is_current = True
             if terminal_check_required:
                 terminal_check_payload = {
                     "decision": str(decision.terminal_check_decision),
@@ -1105,7 +1010,8 @@ def run_episodic_retrieval_loop(
                     raise ValueError(
                         "terminal_check done requires all task progress items to be done"
                     )
-                if decision.terminal_check_decision == "continue" and not has_active_task:
+                if (not task_progress_memory.agenda_initialized
+                        and decision.terminal_check_decision == "continue" and not has_active_task):
                     raise ValueError(
                         "terminal_check continue requires an active task progress item"
                     )
@@ -1120,6 +1026,7 @@ def run_episodic_retrieval_loop(
                         navigation_mode=None,
                         workspace=workspace,
                         progress_update_count=int(progress_update_count),
+                        progress_update_history=deepcopy(progress_update_history),
                         planning_visual_context=planning_visual_context,
                         backtrack_contexts=[
                             deepcopy(item) for item in backtrack_contexts
@@ -1133,6 +1040,7 @@ def run_episodic_retrieval_loop(
             continue
         if task_progress_decision is None or not progress_is_current:
             raise ValueError("navigation action preceded the required progress update")
+        decision = _bind_navigation_subgoal(decision, task_progress_memory)
         if str(decision.action_mode) == "backtrack":
             backtrack_contexts.append(
                 _vln_backtrack_context(
@@ -1164,6 +1072,7 @@ def run_episodic_retrieval_loop(
             navigation_mode=decision,
             workspace=workspace,
             progress_update_count=int(progress_update_count),
+            progress_update_history=deepcopy(progress_update_history),
             planning_visual_context=planning_visual_context,
             backtrack_contexts=[deepcopy(item) for item in backtrack_contexts],
         )
@@ -1177,107 +1086,127 @@ def plan_visual_navigation_action(
     goal: "GoalSpec | None",
     context_evidence_text: str,
 ) -> VisualNavigationDecision:
-    if _goal_kind(goal) != GOAL_KIND_VLN_INSTRUCTION:
-        raise ValueError("the public agent only accepts VLN instructions")
+    validate_waypoint_policy(
+        waypoint_policy_name=state.waypoint_policy_name,
+    )
     goal_text = _goal_text(state=state, goal=goal)
     task_progress_memory = state.system.memory.task_progress
+    active_retrieval_goal = episodic_retrieval_enabled_for_goal(
+        state=state,
+        goal=goal,
+    )
     visual_context = build_visual_action_context(
         state=state,
         step=step,
         context_evidence_text=context_evidence_text,
+        include_arrival_edge=(
+            active_retrieval_goal
+            and _goal_kind(goal) == GOAL_KIND_VLN_INSTRUCTION
+        ),
     )
     physical_visual_context = visual_context
     planning_visual_context = visual_context
     backtrack_contexts: list[dict[str, object]] = []
-    vln_landmark_context = build_vln_landmark_context(
-        landmark_controller=state.landmark_controller,
-        graph=state.graph,
-        visual_context=visual_context,
-        floor_id=str(state.system.current_floor_id),
-    )
-    include_task_progress = True
-    include_graph_context = True
-    initial_navigation_mode: NavigationModeDecision | None = None
-    context_loop = run_episodic_retrieval_loop(
-        state=state,
-        step=step,
-        goal=goal,
-        goal_text=goal_text,
-        visual_context=visual_context,
-        vln_landmark_context=vln_landmark_context,
-    )
-    episodic_context_loop = context_loop
-    task_progress_initialization = context_loop.task_progress_initialization
-    task_progress_decision = context_loop.task_progress_decision
-    task_progress_update_result = context_loop.task_progress_update_result
-    initial_navigation_mode = context_loop.navigation_mode
-    planning_visual_context = (
-        context_loop.planning_visual_context
-        if context_loop.planning_visual_context is not None
-        else physical_visual_context
-    )
-    backtrack_contexts = [
-        deepcopy(item) for item in context_loop.backtrack_contexts
-    ]
-    if str(planning_visual_context.current_node_id) != str(
-        physical_visual_context.current_node_id
-    ):
-        vln_landmark_context = build_vln_landmark_context(
+    vln_landmark_context = (
+        build_vln_landmark_context(
             landmark_controller=state.landmark_controller,
             graph=state.graph,
-            visual_context=planning_visual_context,
+            visual_context=visual_context,
             floor_id=str(state.system.current_floor_id),
         )
-    if str(context_loop.failure_reason).strip() != "":
-        return VisualNavigationDecision(
-            visual_context=planning_visual_context,
-            task_progress_initialization=task_progress_initialization,
-            navigation_mode=None,
-            task_progress_update_result=task_progress_update_result,
-            visual_action=None,
-            waypoint=None,
-            action_call=None,
-            failure_reason=str(context_loop.failure_reason),
-            context_evidence_text=context_evidence_text,
-            physical_current_node_id=str(
-                physical_visual_context.current_node_id
-            ),
-            planning_current_node_id=str(
-                planning_visual_context.current_node_id
-            ),
-            backtrack_contexts=backtrack_contexts,
-        )
-    if initial_navigation_mode is None:
-        terminal_check = {
-            "decision": str(task_progress_decision.terminal_check_decision),
-            "reason": str(task_progress_decision.terminal_check_reasoning),
-            "missing_constraints": [
-                str(item)
-                for item in task_progress_decision.terminal_check_missing_constraints
-            ],
-        }
-        if terminal_check["decision"] != "done":
-            raise ValueError(
-                "missing navigation mode requires a completed terminal check"
-            )
-        return VisualNavigationDecision(
+        if active_retrieval_goal
+        or _goal_kind(goal) == GOAL_KIND_VLN_INSTRUCTION
+        else None
+    )
+    initial_navigation_mode: NavigationModeDecision | None = None
+    episodic_context_loop: EpisodicRetrievalLoopResult | None = None
+    if active_retrieval_goal:
+        context_loop = run_episodic_retrieval_loop(
+            state=state,
+            step=step,
+            goal=goal,
+            goal_text=goal_text,
             visual_context=visual_context,
-            task_progress_initialization=task_progress_initialization,
-            navigation_mode=None,
-            task_progress_update_result=task_progress_update_result,
-            visual_action=None,
-            waypoint=None,
-            action_call=ActionCall(action="done", args={}),
-            context_evidence_text=context_evidence_text,
-            terminal_check=terminal_check,
-            physical_current_node_id=str(
-                physical_visual_context.current_node_id
-            ),
-            planning_current_node_id=str(
-                planning_visual_context.current_node_id
-            ),
-            backtrack_contexts=backtrack_contexts,
+            vln_landmark_context=vln_landmark_context,
         )
+        episodic_context_loop = context_loop
+        task_progress_initialization = context_loop.task_progress_initialization
+        task_progress_decision = context_loop.task_progress_decision
+        task_progress_update_result = context_loop.task_progress_update_result
+        initial_navigation_mode = context_loop.navigation_mode
+        planning_visual_context = (
+            context_loop.planning_visual_context
+            if context_loop.planning_visual_context is not None
+            else physical_visual_context
+        )
+        backtrack_contexts = [
+            deepcopy(item) for item in context_loop.backtrack_contexts
+        ]
+        if str(planning_visual_context.current_node_id) != str(
+            physical_visual_context.current_node_id
+        ):
+            vln_landmark_context = build_vln_landmark_context(
+                landmark_controller=state.landmark_controller,
+                graph=state.graph,
+                visual_context=planning_visual_context,
+                floor_id=str(state.system.current_floor_id),
+            )
+        if str(context_loop.failure_reason).strip() != "":
+            return VisualNavigationDecision(
+                visual_context=planning_visual_context,
+                task_progress_initialization=task_progress_initialization,
+                navigation_mode=None,
+                task_progress_update_result=task_progress_update_result,
+                verify_memory_update_result=(
+                    TaskProgressUpdateResult().to_dict()
+                ),
+                visual_action=None,
+                waypoint=None,
+                action_call=None,
+                failure_reason=str(context_loop.failure_reason),
+                context_evidence_text=context_evidence_text,
+                physical_current_node_id=str(
+                    physical_visual_context.current_node_id
+                ),
+                planning_current_node_id=str(
+                    planning_visual_context.current_node_id
+                ),
+                backtrack_contexts=backtrack_contexts,
+            )
+        if initial_navigation_mode is None:
+            terminal_check = {
+                "decision": str(task_progress_decision.terminal_check_decision),
+                "reason": str(task_progress_decision.terminal_check_reasoning),
+                "missing_constraints": [
+                    str(item)
+                    for item in task_progress_decision.terminal_check_missing_constraints
+                ],
+            }
+            if terminal_check["decision"] != "done":
+                raise ValueError(
+                    "missing navigation mode requires a completed terminal check"
+                )
+            return VisualNavigationDecision(
+                visual_context=visual_context,
+                task_progress_initialization=task_progress_initialization,
+                navigation_mode=None,
+                task_progress_update_result=task_progress_update_result,
+                verify_memory_update_result=TaskProgressUpdateResult().to_dict(),
+                visual_action=None,
+                waypoint=None,
+                action_call=ActionCall(action="done", args={}),
+                context_evidence_text=context_evidence_text,
+                terminal_check=terminal_check,
+                physical_current_node_id=str(
+                    physical_visual_context.current_node_id
+                ),
+                planning_current_node_id=str(
+                    planning_visual_context.current_node_id
+                ),
+                backtrack_contexts=backtrack_contexts,
+            )
+    else:
+        raise ValueError(f"unsupported NavProbe goal kind: {_goal_kind(goal)!r}")
     _record_route_status_for_warning(
         state=state,
         route_status=(
@@ -1287,16 +1216,18 @@ def plan_visual_navigation_action(
         ),
     )
     updated_task_progress_text = (
-        task_progress_memory.format_for_prompt(
+        (task_progress_memory.format_for_prompt(
             include_node_bindings=visual_context.graph_context_visible,
             show_empty_progress_conditions=episodic_context_loop is not None,
-        )
+        ))
     )
+    def verify_memory_update_payload() -> dict[str, object]:
+        return TaskProgressUpdateResult().to_dict()
+
     navigation_replan_feedback: list[dict[str, object]] = []
     rejected_backtrack_anchor_node_ids: set[str] = set()
     waypoint_attempts: list[VisualWaypointAttempt] = []
     visual_action: VisualActionPointDecision | None = None
-    accepted_verification: VisualWaypointVerificationDecision | None = None
     local_move_plan: LocalMovePlanDecision | None = None
     selected_view: VisualViewContext | None = None
     navigation_mode: NavigationModeDecision | None = initial_navigation_mode
@@ -1315,6 +1246,13 @@ def plan_visual_navigation_action(
                     )
                     - rejected_backtrack_anchor_node_ids
                 )
+                if navigation_replan_feedback and navigation_replan_feedback[-1].get("failure_reason") in {
+                    "navigation_intent_has_no_matching_frontier",
+                    "navigation_intent_has_no_matching_waypoint",
+                }:
+                    # These retries revise local intent at the same reference.
+                    # Backtrack selection requires the executive/retrieval loop.
+                    replan_backtrack_node_ids = set()
                 navigation_mode = decide_vln_navigation_step(
                     client=state.llm_client,
                     cache=state.cache,
@@ -1327,6 +1265,7 @@ def plan_visual_navigation_action(
                         else []
                     ),
                     latest_task_progress=task_progress_decision,
+                    original_instruction=goal_text,
                     backtrack_context_text=_vln_backtrack_context_text(
                         backtrack_contexts
                     ),
@@ -1361,8 +1300,11 @@ def plan_visual_navigation_action(
                 step.episodic_retrieval["final_navigation_mode"] = (
                     navigation_mode.to_dict()
                 )
+        navigation_mode = _bind_navigation_subgoal(navigation_mode, task_progress_memory)
+        current_verify_memory_update_result = verify_memory_update_payload()
         if (
-            str(navigation_mode.action_mode) == "approach_to_stop"
+            _uses_system_active_waypoint_grounding(goal_kind=_goal_kind(goal))
+            and str(navigation_mode.action_mode) == "approach_to_stop"
             and str(navigation_mode.approach_movement) == "stay"
         ):
             planning_node_id = str(planning_visual_context.current_node_id)
@@ -1381,7 +1323,7 @@ def plan_visual_navigation_action(
                     goal_xy=(float(goal_xy[0]), float(goal_xy[1])),
                     goal_yaw=float(planning_node.yaw),
                     world_z=float(planning_node.position[2]),
-                    policy_name=FRONTIER_SKELETON_SAMPLE_WAYPOINT_POLICY,
+                    policy_name=state.waypoint_policy_name,
                     source_type="planning_node",
                     source_id=planning_node_id,
                     obs_id=str(planning_visual_context.view_for_angle(0).obs_id),
@@ -1392,6 +1334,7 @@ def plan_visual_navigation_action(
                     task_progress_initialization=task_progress_initialization,
                     navigation_mode=navigation_mode,
                     task_progress_update_result=task_progress_update_result,
+                    verify_memory_update_result=current_verify_memory_update_result,
                     visual_action=None,
                     waypoint=None,
                     action_call=target.to_action_call(),
@@ -1404,7 +1347,7 @@ def plan_visual_navigation_action(
                     ),
                     grounded_waypoint_target=target,
                     waypoint_policy_result=WaypointPolicyResult(
-                        policy_name=FRONTIER_SKELETON_SAMPLE_WAYPOINT_POLICY,
+                        policy_name=state.waypoint_policy_name,
                         target=target,
                         reasoning=str(navigation_mode.action_reason),
                     ),
@@ -1420,6 +1363,7 @@ def plan_visual_navigation_action(
                 task_progress_initialization=task_progress_initialization,
                 navigation_mode=navigation_mode,
                 task_progress_update_result=task_progress_update_result,
+                verify_memory_update_result=current_verify_memory_update_result,
                 visual_action=None,
                 waypoint=None,
                 action_call=None,
@@ -1430,13 +1374,13 @@ def plan_visual_navigation_action(
                 planning_current_node_id=planning_node_id,
                 backtrack_contexts=backtrack_contexts,
             )
-        use_vln_fss_stop = str(navigation_mode.action_mode) in {
-            "stop",
-            "approach_to_stop",
-        }
+        use_waypoint_stop = (
+            _goal_kind(goal) in {GOAL_KIND_VLN_INSTRUCTION, GOAL_KIND_OBJECT_CATEGORY}
+            and str(navigation_mode.action_mode) in {"stop", "approach_to_stop"}
+        )
         if (
             navigation_mode.action_mode in {"go_to_waypoint", "backtrack"}
-            or use_vln_fss_stop
+            or use_waypoint_stop
         ):
             use_system_active_progress = (
                 str(navigation_mode.action_mode) == "go_to_waypoint"
@@ -1444,9 +1388,9 @@ def plan_visual_navigation_action(
                     goal_kind=_goal_kind(goal),
                 )
             )
-            context_active_progress_item = _current_active_task_progress_item(
-                task_progress_memory
-            )
+            context_active_progress_item = (_current_active_task_progress_item(
+                task_progress_memory, navigation_mode.subgoal_id
+            ))
             active_progress_item = (
                 context_active_progress_item if use_system_active_progress else ""
             )
@@ -1454,10 +1398,13 @@ def plan_visual_navigation_action(
                 context_loop=episodic_context_loop,
                 task_progress=task_progress_decision,
                 navigation_mode=navigation_mode,
-                active_progress_item=context_active_progress_item,
                 task_progress_text=updated_task_progress_text,
+                original_instruction=goal_text,
+                dynamic_agenda=task_progress_memory.agenda_initialized,
             )
-            use_candidate_bev = True
+            use_candidate_bev = _uses_system_active_waypoint_grounding(
+                goal_kind=_goal_kind(goal),
+            )
             candidate_bev_base = None
             if use_candidate_bev:
                 candidate_bev_reference_node_id = _vln_sampled_planner_node_id(
@@ -1486,6 +1433,7 @@ def plan_visual_navigation_action(
                 task_progress_initialization=task_progress_initialization,
                 navigation_mode=navigation_mode,
                 task_progress_update_result=task_progress_update_result,
+                verify_memory_update_result=current_verify_memory_update_result,
                 context_evidence_text=context_evidence_text,
                 inherited_agent_context_content=inherited_agent_context_content,
                 active_progress_item=active_progress_item,
@@ -1515,14 +1463,14 @@ def plan_visual_navigation_action(
                     else candidate_bev_base.context_text
                 ),
             )
-            if use_vln_fss_stop:
+            if use_waypoint_stop:
                 policy_output = _plan_frontier_skeleton_sample_stop_policy(
                     policy_context
                 )
             else:
-                policy_output = _plan_frontier_skeleton_sample_waypoint_policy(
-                    policy_context
-                )
+                policy_output = _waypoint_policy_registry().get(
+                    state.waypoint_policy_name
+                ).plan(policy_context)
             waypoint_decision = replace(
                 policy_output.decision,
                 waypoint_policy_result=policy_output.result,
@@ -1537,6 +1485,16 @@ def plan_visual_navigation_action(
                     deepcopy(item) for item in backtrack_contexts
                 ],
             )
+            if policy_output.result.failure_reason == "navigation_intent_has_no_matching_waypoint":
+                navigation_replan_feedback.extend(waypoint_decision.navigation_replan_feedback)
+                if navigation_attempt_index + 1 < NAVIGATION_REPLAN_MAX_ATTEMPTS:
+                    navigation_mode = None
+                    continue
+                return _with_replan_log(
+                    replace(waypoint_decision, navigation_replan_feedback=[]),
+                    waypoint_attempts=waypoint_attempts,
+                    navigation_replan_feedback=navigation_replan_feedback,
+                )
             if str(policy_output.result.failure_reason) in {
                 "no_projected_sampled_waypoint_candidates",
                 "go_to_waypoint_no_active_frontiers",
@@ -1629,16 +1587,62 @@ def plan_visual_navigation_action(
                 navigation_replan_feedback=navigation_replan_feedback,
             )
         if navigation_mode.action_mode == "vertical_transition":
+            request_error = (
+                "vertical_transition_requires_waypoint_target"
+                if not navigation_mode.waypoint_target else None
+            )
+            if request_error is not None:
+                navigation_replan_feedback.append(
+                    {
+                        "action_mode": "vertical_transition",
+                        "failure_reason": request_error,
+                        "failure_summary": request_error,
+                    }
+                )
+                if navigation_attempt_index + 1 < NAVIGATION_REPLAN_MAX_ATTEMPTS:
+                    navigation_mode = None
+                    continue
+                return _visual_navigation_failure(
+                    visual_context=planning_visual_context,
+                    task_progress_initialization=task_progress_initialization,
+                    navigation_mode=navigation_mode,
+                    task_progress_update_result=task_progress_update_result,
+                    verify_memory_update_result=current_verify_memory_update_result,
+                    failure_reason=request_error,
+                    visual_action=None,
+                    waypoint_attempts=waypoint_attempts,
+                    navigation_replan_feedback=navigation_replan_feedback,
+                    context_evidence_text=context_evidence_text,
+                )
             return VisualNavigationDecision(
                 visual_context=planning_visual_context,
                 task_progress_initialization=task_progress_initialization,
                 navigation_mode=navigation_mode,
                 task_progress_update_result=task_progress_update_result,
+                verify_memory_update_result=current_verify_memory_update_result,
                 visual_action=None,
                 waypoint=None,
                 action_call=ActionCall(
                     action="vertical_transition",
-                    args={"direction": str(navigation_mode.vertical_direction)},
+                    args={
+                        "direction": str(navigation_mode.vertical_direction),
+                        **({
+                            "waypoint_target": navigation_mode.waypoint_target,
+                            "subgoal_id": navigation_mode.subgoal_id,
+                            "subgoal_attempt": navigation_mode.subgoal_attempt,
+                            "task_context": "\n".join(
+                                str(block.get("text", ""))
+                                for block in _vln_waypoint_inherited_agent_context(
+                                    context_loop=episodic_context_loop,
+                                    task_progress=task_progress_decision,
+                                    navigation_mode=navigation_mode,
+                                    task_progress_text=updated_task_progress_text,
+                                    original_instruction=goal_text,
+                                    dynamic_agenda=True,
+                                )
+                            ),
+                        }),
+                    },
                 ),
                 waypoint_attempts=waypoint_attempts,
                 navigation_replan_feedback=navigation_replan_feedback,
@@ -1653,41 +1657,19 @@ def plan_visual_navigation_action(
                     deepcopy(item) for item in backtrack_contexts
                 ],
             )
-        raise ValueError(
-            f"unsupported canonical VLN navigation mode: {navigation_mode.action_mode!r}"
-        )
-    raise ValueError("canonical VLN navigation replanning was exhausted")
-
-
-def confirm_pending_visual_stop(
-    *,
-    state: "NavClawAgentState",
-    step: "NavClawStepState",
-    goal: "GoalSpec | None",
-    pending_stop: dict[str, object],
-) -> dict[str, object]:
-    goal_text = _goal_text(state=state, goal=goal)
-    visual_context = build_visual_action_context(
-        state=state,
-        step=step,
-        context_evidence_text="",
+        raise ValueError(f"unsupported navigation mode: {navigation_mode.action_mode!r}")
+    return _visual_navigation_failure(
+        visual_context=planning_visual_context,
+        task_progress_initialization=task_progress_initialization,
+        navigation_mode=navigation_mode,
+        task_progress_update_result=task_progress_update_result,
+        verify_memory_update_result=verify_memory_update_payload(),
+        visual_action=None,
+        waypoint_attempts=waypoint_attempts,
+        failure_reason="navigation_replan_exhausted",
+        context_evidence_text=context_evidence_text,
+        navigation_replan_feedback=navigation_replan_feedback,
     )
-    decision = decide_stop_confirmation(
-        client=state.llm_client,
-        cache=state.cache,
-        goal_text=goal_text,
-        goal_kind=_goal_kind(goal),
-        visual_context=visual_context,
-        pending_stop=pending_stop,
-    )
-    payload = {
-        "pending_stop": deepcopy(pending_stop),
-        "visual_context": visual_context.to_dict(),
-        "decision": decision.to_dict(),
-    }
-    step.stop_confirmation = payload
-    state.stop_confirmation_history.append(payload)
-    return payload
 
 
 def _plan_vln_waypoint_navigation(
@@ -1699,6 +1681,7 @@ def _plan_vln_waypoint_navigation(
     task_progress_initialization: dict[str, object],
     navigation_mode: NavigationModeDecision,
     task_progress_update_result: TaskProgressUpdateResult,
+    verify_memory_update_result: dict[str, object],
     context_evidence_text: str,
     inherited_agent_context_content: list[dict[str, object]],
     active_progress_item: str = "",
@@ -1768,6 +1751,14 @@ def _plan_vln_waypoint_navigation(
             != str(action_origin_visual_context.current_node_id)
             else "the current robot heading"
         )
+    if bool(state.show_cardinal_bev) and waypoint_loop is plan_vln_waypoint_loop:
+        waypoint_context_kwargs["show_cardinal_border"] = True
+        direction_note = "BEV cardinal frame: N=world +Y/up, E=world +X/right, S=-Y/down, W=-X/left."
+        waypoint_context_kwargs["candidate_bev_context_text"] = "\n".join(
+            item
+            for item in (str(candidate_bev_context_text).strip(), direction_note)
+            if item != ""
+        )
     if candidate_bev_base_image is not None:
         waypoint_context_kwargs["candidate_bev_coordinate_exploration"] = (
             state.global_exploration_for_floor(
@@ -1786,6 +1777,7 @@ def _plan_vln_waypoint_navigation(
             VLN_WAYPOINT_GLOBAL_NODE_DEDUP_RADIUS_M
         )
     result = waypoint_loop(
+        frontier_only=False,
         client=state.llm_client,
         cache=state.cache,
         goal_text="",
@@ -1831,6 +1823,7 @@ def _plan_vln_waypoint_navigation(
             task_progress_initialization=task_progress_initialization,
             navigation_mode=navigation_mode,
             task_progress_update_result=task_progress_update_result,
+            verify_memory_update_result=verify_memory_update_result,
             visual_action=result.visual_action,
             waypoint_attempts=waypoint_attempts,
             failure_reason=str(result.failure_reason or no_action_failure),
@@ -1885,6 +1878,7 @@ def _plan_vln_waypoint_navigation(
         task_progress_initialization=task_progress_initialization,
         navigation_mode=navigation_mode,
         task_progress_update_result=task_progress_update_result,
+        verify_memory_update_result=verify_memory_update_result,
         visual_action=result.visual_action,
         waypoint=waypoint,
         action_call=action_call,
@@ -2040,15 +2034,6 @@ def _vln_sampled_planner_node_id(
     return anchor_node_id
 
 
-def _vln_navigation_uses_prior_node(
-    navigation_mode: NavigationModeDecision,
-) -> bool:
-    return (
-        str(navigation_mode.action_mode) == "backtrack"
-        or str(navigation_mode.route_status) == "recovery_needed"
-    )
-
-
 def _vln_prior_node_reason(navigation_mode: NavigationModeDecision) -> str:
     if str(navigation_mode.action_mode) == "backtrack":
         return str(navigation_mode.backtrack_reason)
@@ -2202,18 +2187,6 @@ def _vln_waypoint_attempts_from_records(records: list[dict[str, object]]) -> lis
     return attempts
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 def _plan_sampled_waypoint_policy(
     context: WaypointPlanningContext,
     *,
@@ -2239,6 +2212,7 @@ def _plan_sampled_waypoint_policy(
         task_progress_initialization=context.task_progress_initialization,
         navigation_mode=context.navigation_mode,
         task_progress_update_result=context.task_progress_update_result,
+        verify_memory_update_result=context.verify_memory_update_result,
         context_evidence_text=context.context_evidence_text,
         inherited_agent_context_content=context.inherited_agent_context_content,
         active_progress_item=getattr(context, "active_progress_item", ""),
@@ -2326,7 +2300,7 @@ def _plan_frontier_skeleton_sample_stop_policy(
 ) -> WaypointPolicyOutput:
     return _plan_sampled_waypoint_policy(
         context,
-        policy_name=FRONTIER_SKELETON_SAMPLE_WAYPOINT_POLICY,
+        policy_name=context.state.waypoint_policy_name,
         source_type="stop_sample",
         waypoint_loop=plan_vln_waypoint_loop,
         selection_kind="stop_sampled_waypoint_candidate",
@@ -2337,14 +2311,15 @@ def _plan_frontier_skeleton_sample_stop_policy(
     )
 
 
-
-
-
-
-
-
-
-
+def _waypoint_policy_registry() -> WaypointPolicyRegistry:
+    return WaypointPolicyRegistry(
+        [
+            FunctionWaypointPolicy(
+                name=FRONTIER_SKELETON_SAMPLE_WAYPOINT_POLICY,
+                handler=_plan_frontier_skeleton_sample_waypoint_policy,
+            ),
+        ]
+    )
 
 
 def _visual_navigation_failure(
@@ -2353,6 +2328,7 @@ def _visual_navigation_failure(
     task_progress_initialization: dict[str, object],
     navigation_mode: NavigationModeDecision,
     task_progress_update_result: TaskProgressUpdateResult,
+    verify_memory_update_result: dict[str, object],
     visual_action: VisualActionPointDecision | None,
     waypoint_attempts: list[VisualWaypointAttempt],
     failure_reason: str,
@@ -2365,6 +2341,7 @@ def _visual_navigation_failure(
         task_progress_initialization=task_progress_initialization,
         navigation_mode=navigation_mode,
         task_progress_update_result=task_progress_update_result,
+        verify_memory_update_result=verify_memory_update_result,
         visual_action=visual_action,
         waypoint=None,
         action_call=None,
@@ -2410,19 +2387,3 @@ def _robot_xy_from_step(
         raise ValueError("cannot infer robot_xy without current observation or current node")
     node = state.graph.get_node(current_node_id)
     return (float(node.position[0]), float(node.position[1]))
-
-
-def _candidate_source_view(
-    *,
-    step: "NavClawStepState",
-    visual_context: VisualActionContext,
-    candidate_view: VisualViewContext,
-) -> dict[str, object]:
-    return {
-        "step_index": int(step.place_step_index),
-        "node_id": str(visual_context.current_node_id),
-        "angle_deg": int(candidate_view.angle_deg),
-        "obs_id": str(candidate_view.obs_id),
-        "image_id": str(candidate_view.node_overlay_image_id),
-        "visible_visited_nodes": [str(node_id) for node_id in candidate_view.visible_visited_nodes],
-    }

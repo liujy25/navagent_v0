@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-import math
+import json
 from typing import TYPE_CHECKING
 
 from navclaw.agent.node_moves import attach_backtrack_edge_knowledge
@@ -11,15 +11,13 @@ from navclaw.agent.visual_action_context import (
     VisualViewContext,
     build_visual_action_context_for_node,
 )
-from navclaw.agent.visual_grounding import VisualWaypoint, ground_visual_waypoint
-from navclaw.agent.visual_policy import (
-    decide_vertical_transition_visual_action_point,
-    verify_vertical_transition_waypoint,
-)
+from navclaw.agent.visual_grounding import VisualWaypoint
 from navclaw.agent.visual_policy_decisions import (
     VisualActionPointDecision,
     VisualWaypointVerificationDecision,
 )
+from navclaw.agent.vertical_fss import prepare_vertical_fss_candidates, vertical_fss_visual_waypoint
+from navclaw.agent.vertical_transition_policy import select_vertical_fss_waypoint
 from navclaw.agent.vertical_transition_policy import (
     VerticalTransitionStepDecision,
     decide_vertical_transition_step,
@@ -34,27 +32,15 @@ from navclaw.types import LocalmapPlaceReuseState
 if TYPE_CHECKING:
     from navclaw.agent.actions import AgentAction
     from navclaw.agent.state import NavClawAgentContext, NavClawAgentState, NavClawStepState
-    from navclaw.runtime.cache import RuntimeCache
 
 
-DEFAULT_MAX_VERTICAL_TRANSITION_STEPS = 8
 DEFAULT_VERTICAL_FLOOR_MATCH_THRESHOLD_M = 0.8
-VERTICAL_COMPLETION_MIN_PROGRESS_M = 0.3
-VERTICAL_WAYPOINT_VERIFICATION_MAX_ATTEMPTS = 4
-VERTICAL_WAYPOINT_GEOMETRY_DIRECTION_TOLERANCE_M = 0.15
-VERTICAL_WAYPOINT_MAX_LOCAL_XY_DISTANCE_M = 2.0
 VERTICAL_STEP_REPLAN_MAX_ATTEMPTS = 4
 
 
 class _NoopVerticalTransitionExploration:
     def observe_raw_observation(self, observation: object) -> None:
         return None
-
-
-class VerticalTransitionStepReplan(ValueError):
-    def __init__(self, message: str, *, feedback: dict[str, object]) -> None:
-        super().__init__(message)
-        self.feedback = feedback
 
 
 @dataclass(frozen=True)
@@ -87,14 +73,21 @@ def execute_vertical_transition_action(
     direction = str(action.args.get("direction", "")).strip()
     if direction not in {"up", "down"}:
         raise ValueError(f"vertical_transition requires direction up or down, got {direction!r}")
-    max_steps = int(
-        action.args.get(
-            "max_steps",
-            getattr(context.args, "max_vertical_transition_steps", DEFAULT_MAX_VERTICAL_TRANSITION_STEPS),
-        )
-    )
-    if max_steps <= 0:
-        raise ValueError(f"max_vertical_transition_steps must be positive, got {max_steps}")
+    objective = str(action.args.get("waypoint_target", "")).strip()
+    subgoal_id = action.args.get("subgoal_id")
+    subgoal_attempt = action.args.get("subgoal_attempt")
+    completion_key = None
+    if not objective:
+        raise ValueError("NavProbe VerticalMove requires waypoint_target")
+    memory = state.system.memory.task_progress
+    if subgoal_id is None:
+        if memory.items:
+            raise ValueError("NavProbe VerticalMove requires a subgoal for a nonempty agenda")
+    else:
+        selected = next((item for item in memory.items if item.subgoal_id == subgoal_id), None)
+        if selected is None or selected.status != "active" or selected.attempt != subgoal_attempt:
+            raise ValueError("NavProbe VerticalMove requires the selected active subgoal attempt")
+        completion_key = f"{subgoal_id}:{subgoal_attempt}"
     floor_match_threshold_m = float(
         action.args.get(
             "floor_match_threshold_m",
@@ -130,9 +123,12 @@ def execute_vertical_transition_action(
     step.policy_decision.setdefault("vertical_transition", {})
     step.policy_decision["vertical_transition"] = {
         "direction": direction,
-        "max_steps": int(max_steps),
+        "algorithm": "detected_stair_fss",
+        "subgoal_id": subgoal_id,
+        "subgoal_attempt": subgoal_attempt,
+        "waypoint_target": objective,
+        "max_steps": 1,
         "floor_match_threshold_m": float(floor_match_threshold_m),
-        "completion_min_progress_m": float(VERTICAL_COMPLETION_MIN_PROGRESS_M),
         "before_node_id": before_node_id,
         "before_floor_id": before_floor_id,
         "before_floor_height": before_floor_height,
@@ -193,11 +189,12 @@ def execute_vertical_transition_action(
             step_decision = decide_vertical_transition_step(
                 client=state.llm_client,
                 cache=state.cache,
-                instruction=_vertical_transition_instruction(direction),
+                instruction=objective,
                 visual_context=visual_context,
                 initial_observation=(move_count == 0),
                 movement_rgb_history_blocks=vt_rgb_history_blocks,
                 current_retry_feedback=current_retry_feedback,
+                planning_reference=planning_node_id != before_node_id and move_count == 0,
             )
         except ValueError as exc:
             failure_reason = f"step_planner_failed:{exc}"
@@ -225,25 +222,25 @@ def execute_vertical_transition_action(
             observed_heights=vt_observed_heights,
         )
         attempt_payload["vertical_transition_height_progress_m"] = float(height_progress_m)
-        attempt_payload["vertical_transition_min_completion_progress_m"] = float(
-            VERTICAL_COMPLETION_MIN_PROGRESS_M
-        )
-        if step_decision.transition_status == "complete":
-            if height_progress_m < float(VERTICAL_COMPLETION_MIN_PROGRESS_M):
+        # NavProbe returns to the executive after one grounded local move.
+        # The fresh status records floor/endpoint evidence without completing
+        # the agenda or forcing a full staircase traversal within this skill.
+        local_move_finished = move_count == 1
+        if step_decision.transition_status == "complete" or local_move_finished:
+            if planning_node_id != before_node_id and move_count == 0:
                 feedback = {
                     "type": "completion_rejected",
                     "requested_direction": str(direction),
-                    "reason": "height_progress_below_min_completion_progress",
-                    "thought": str(step_decision.thought),
+                    "reason": "virtual_reference_is_not_physical_completion",
+                    "planner_reason": str(step_decision.reason),
                     "height_progress_m": float(height_progress_m),
-                    "min_completion_progress_m": float(VERTICAL_COMPLETION_MIN_PROGRESS_M),
                 }
                 step_replan_count += 1
                 feedback["transition_index"] = int(move_count)
                 feedback["step_replan_attempt_index"] = int(step_replan_count)
                 current_retry_feedback = feedback
                 attempt_payload["transition_completion_forced_continue_reason"] = (
-                    "height_progress_below_min_completion_progress"
+                    "virtual_reference_is_not_physical_completion"
                 )
                 attempt_payload["replanned_by_vt_step_planner"] = True
                 attempt_payload["step_replan_feedback"] = feedback
@@ -251,7 +248,7 @@ def execute_vertical_transition_action(
                 if step_replan_count >= VERTICAL_STEP_REPLAN_MAX_ATTEMPTS:
                     failure_reason = (
                         "vt_step_replan_exhausted:"
-                        "completion_rejected_height_progress_below_min_completion_progress"
+                        "completion_rejected_virtual_reference"
                     )
                     break
                 continue
@@ -277,49 +274,51 @@ def execute_vertical_transition_action(
                     waypoint_plan=last_waypoint_plan,
                     planning_node_id=planning_node_id,
                     backtrack_contexts=backtrack_contexts,
+                    destination_floor_reached=step_decision.destination_floor_reached,
+                    subgoal_id=subgoal_id,
+                    subgoal_attempt=subgoal_attempt,
                 )
+                step.executed_action.update({
+                    "algorithm": "detected_stair_fss", "subgoal_id": subgoal_id,
+                    "subgoal_attempt": subgoal_attempt, "waypoint_target": objective,
+                    "objective_completed": step_decision.transition_status == "complete",
+                })
+                evidence = {
+                    key: deepcopy(step.executed_action.get(key))
+                    for key in ("subgoal_id", "subgoal_attempt", "waypoint_target", "direction",
+                                "before_node_id", "after_node_id", "before_floor_id",
+                                "after_floor_id", "edge_id", "objective_completed")
+                }
+                if completion_key is not None and step_decision.transition_status == "complete":
+                    state.completed_stair_items[completion_key] = evidence
+                results[-1][1].data.update(evidence)
             except ValueError as exc:
                 failure_reason = f"floor_resolution_failed:{exc}"
                 attempt_payload["floor_resolution_failure"] = str(exc)
                 break
             return
         if step_decision.transition_status == "fail":
-            failure_reason = f"step_planner_failed:{step_decision.thought}"
+            failure_reason = f"step_planner_failed:{step_decision.reason}"
             attempt_payload["failure_reason"] = failure_reason
             attempts.append(attempt_payload)
             break
 
-        if move_count >= max_steps:
+        if move_count >= 1:
             failure_reason = "vertical_transition_exhausted"
             attempt_payload["failure_reason"] = failure_reason
             attempts.append(attempt_payload)
             break
 
         try:
-            waypoint_plan = _plan_vertical_transition_waypoint(
+            waypoint_plan = (_plan_navprobe_vertical_waypoint)(
                 state=state,
                 direction=direction,
                 visual_context=visual_context,
                 step_decision=step_decision,
                 current_height_m=current_height,
+                objective=objective,
+                task_context=_navprobe_vertical_task_context(step, action),
             )
-        except VerticalTransitionStepReplan as exc:
-            step_replan_count += 1
-            feedback = dict(exc.feedback)
-            feedback["rejected_options"] = _merge_vertical_transition_rejected_options(
-                current_retry_feedback,
-                feedback,
-            )
-            feedback["transition_index"] = int(move_count)
-            feedback["step_replan_attempt_index"] = int(step_replan_count)
-            current_retry_feedback = feedback
-            attempt_payload["replanned_by_vt_step_planner"] = True
-            attempt_payload["step_replan_feedback"] = feedback
-            attempts.append(attempt_payload)
-            if step_replan_count >= VERTICAL_STEP_REPLAN_MAX_ATTEMPTS:
-                failure_reason = f"vt_step_replan_exhausted:{exc}"
-                break
-            continue
         except ValueError as exc:
             failure_reason = f"waypoint_plan_failed:{exc}"
             attempt_payload["ok"] = False
@@ -329,10 +328,26 @@ def execute_vertical_transition_action(
         final_waypoint_verification = waypoint_plan.waypoint_verification
         last_waypoint_plan = waypoint_plan
 
+        move_path = list(waypoint_plan.waypoint.path_xy)
+        if move_count == 0:
+            if planning_node_id != before_node_id:
+                physical_pose = context.env.get_obs().pose
+                prefix = before_exploration.map.compute_astar_path(
+                    start_xy=(float(physical_pose.x), float(physical_pose.y)),
+                    goal_xy=move_path[0],
+                )
+                if prefix is None or len(prefix) == 0:
+                    failure_reason = "no_physical_path_to_backtrack_anchor"
+                    attempt_payload["failure_reason"] = failure_reason
+                    attempts.append(attempt_payload)
+                    break
+                move_path = [tuple(map(float, point)) for point in prefix] + move_path[1:]
+            if subgoal_id is not None:
+                state.system.memory.task_progress.mark_subgoal_started(subgoal_id, before_node_id)
         move_call = ActionCall(
             action="move_along_path",
             args={
-                "path_xy": [[float(x), float(y)] for x, y in waypoint_plan.waypoint.path_xy],
+                "path_xy": [[float(x), float(y)] for x, y in move_path],
                 "final_yaw": float(waypoint_plan.waypoint.goal_yaw),
                 "final_z": float(waypoint_plan.waypoint.raw_world_z),
             },
@@ -408,9 +423,6 @@ def execute_vertical_transition_action(
             observed_heights=vt_observed_heights,
         )
         attempt_payload["vertical_transition_height_progress_m"] = float(height_progress_m)
-        attempt_payload["vertical_transition_min_completion_progress_m"] = float(
-            VERTICAL_COMPLETION_MIN_PROGRESS_M
-        )
         current_retry_feedback = None
         move_count += 1
         step_replan_count = 0
@@ -446,6 +458,10 @@ def execute_vertical_transition_action(
     step.executed_action = {
         "type": "vertical_transition",
         "route_completed": False,
+        "algorithm": "detected_stair_fss",
+        "subgoal_id": subgoal_id,
+        "subgoal_attempt": subgoal_attempt,
+        "waypoint_target": objective,
         "direction": direction,
         "before_node_id": before_node_id,
         "planning_node_id": planning_node_id,
@@ -492,6 +508,9 @@ def _finish_vertical_transition_action(
     waypoint_plan: VerticalTransitionWaypointPlan | None,
     planning_node_id: str,
     backtrack_contexts: list[dict[str, object]],
+    destination_floor_reached: bool,
+    subgoal_id: str | None = None,
+    subgoal_attempt: int | None = None,
 ) -> None:
     completion = _complete_vertical_transition(
         graph=state.graph,
@@ -504,6 +523,7 @@ def _finish_vertical_transition_action(
         final_panorama=final_panorama,
         rgb_history_obs_ids=rgb_history_obs_ids,
         path_xy=path_xy,
+        destination_floor_reached=destination_floor_reached,
     )
     state.system.set_current_floor(
         str(completion["after_floor_id"]),
@@ -534,6 +554,7 @@ def _finish_vertical_transition_action(
         rgb_history_obs_ids=rgb_history_obs_ids,
         planning_node_id=planning_node_id,
         backtrack_contexts=backtrack_contexts,
+        subgoal_id=subgoal_id, subgoal_attempt=subgoal_attempt,
     )
     if backtrack_contexts != []:
         edge = next(
@@ -584,10 +605,7 @@ def _finish_vertical_transition_action(
             "executed_move_history": [dict(item) for item in executed_move_history],
             "va_result_history": [dict(item) for item in executed_move_history],
         },
-        message=(
-            f"Completed vertical transition {direction} from "
-            f"{before_floor_id} to {completion['after_floor_id']}."
-        ),
+        message=f"Executed local VerticalMove {direction}; endpoint assessment: {step_decision.transition_status}.",
     )
     results.append((completion_call, completion_result))
     step.results = results
@@ -615,193 +633,58 @@ def _finish_vertical_transition_action(
     state.last_executed_action = step.executed_action
 
 
-def _plan_vertical_transition_waypoint(
-    *,
-    state: "NavClawAgentState",
-    direction: str,
-    visual_context: VisualActionContext,
-    step_decision: VerticalTransitionStepDecision,
-    current_height_m: float,
-) -> VerticalTransitionWaypointPlan:
-    goal_text = _vertical_transition_goal_text(direction)
-    if step_decision.selected_angle_deg is None:
-        raise ValueError("vertical_transition_step_missing_angle")
-    if step_decision.waypoint_target == "":
-        raise ValueError("vertical_transition_step_missing_waypoint_target")
-    selected_view = visual_context.view_for_angle(step_decision.selected_angle_deg)
-
-    revision_feedback = ""
-    rejected_point_2d: tuple[float, float] | None = None
-    attempts: list[dict[str, object]] = []
-    for attempt_index in range(VERTICAL_WAYPOINT_VERIFICATION_MAX_ATTEMPTS):
-        visual_action = decide_vertical_transition_visual_action_point(
-            client=state.llm_client,
-            cache=state.cache,
-            selected_view=selected_view,
-            waypoint_target=str(step_decision.waypoint_target),
-            revision_feedback=revision_feedback,
-            rejected_point_2d=rejected_point_2d,
-        )
-        attempt_payload: dict[str, object] = {
-            "attempt_index": int(attempt_index),
-            "visual_action": visual_action.to_dict(),
-        }
-        if visual_action.status == "failure" or visual_action.failure_reason != "":
-            attempt_payload["failure_reason"] = str(visual_action.failure_reason)
-            attempts.append(attempt_payload)
-            raise VerticalTransitionStepReplan(
-                "vertical_visual_action_grounding_failure",
-                feedback={
-                    "type": "visual_action_grounding_failure",
-                    "requested_direction": str(direction),
-                    "rejected_options": [
-                        {
-                            "angle_deg": int(selected_view.angle_deg),
-                            "waypoint_target": str(step_decision.waypoint_target),
-                        }
-                    ],
-                    "feedback": str(visual_action.failure_reason),
-                    "visual_action": visual_action.to_dict(),
-                },
-            )
-        if visual_action.point_2d is None:
-            attempt_payload["failure_reason"] = "visual_action_missing_point_2d"
-            attempts.append(attempt_payload)
-            raise ValueError("visual_action_missing_point_2d")
-
-        grounded_waypoint: VisualWaypoint | None = None
-        geometry_warning = ""
-        try:
-            grounded_waypoint = ground_visual_waypoint(
-                cache=state.cache,
-                exploration=state.global_exploration_for_floor(str(state.system.current_floor_id)),
-                obs_id=selected_view.obs_id,
-                angle_deg=selected_view.angle_deg,
-                point_2d=visual_action.point_2d,
-                waypoint_target=str(step_decision.waypoint_target),
-                target=str(visual_action.target),
-                use_navigation_snap=False,
-            )
-            attempt_payload["grounded_waypoint_preview"] = grounded_waypoint.to_dict()
-            geometry_warning = _vertical_waypoint_geometry_warning(
-                direction=direction,
-                current_height_m=current_height_m,
-                waypoint=grounded_waypoint,
-            )
-            if geometry_warning != "":
-                attempt_payload["geometry_warning"] = geometry_warning
-        except ValueError as exc:
-            attempt_payload["grounding_failure"] = str(exc)
-
-        if grounded_waypoint is not None:
-            local_distance_m = _vertical_waypoint_local_xy_distance_m(
-                cache=state.cache,
-                waypoint=grounded_waypoint,
-            )
-            attempt_payload["local_xy_distance_m"] = float(local_distance_m)
-            if local_distance_m > float(VERTICAL_WAYPOINT_MAX_LOCAL_XY_DISTANCE_M):
-                attempt_payload["failure_reason"] = "vertical_waypoint_too_far"
-                attempts.append(attempt_payload)
-                revision_feedback = (
-                    "The selected point is beyond one local stair-transition move. "
-                    "Select a nearer reachable point on the same route, using the "
-                    "first stable floor immediately beyond the final tread when it "
-                    "is visible."
-                )
-                rejected_point_2d = visual_action.point_2d
-                if (
-                    attempt_index + 1
-                    >= VERTICAL_WAYPOINT_VERIFICATION_MAX_ATTEMPTS
-                ):
-                    raise VerticalTransitionStepReplan(
-                        "vertical_waypoint_too_far",
-                        feedback={
-                            "type": "previous_waypoint_rejected",
-                            "requested_direction": str(direction),
-                            "rejected_options": [
-                                {
-                                    "angle_deg": int(selected_view.angle_deg),
-                                    "waypoint_target": str(
-                                        step_decision.waypoint_target
-                                    ),
-                                }
-                            ],
-                            "feedback": revision_feedback,
-                            "selected_waypoint_geometry": {
-                                "local_xy_distance_m": float(local_distance_m),
-                                "max_local_xy_distance_m": float(
-                                    VERTICAL_WAYPOINT_MAX_LOCAL_XY_DISTANCE_M
-                                ),
-                            },
-                        },
-                    )
-                continue
-
-        verification = verify_vertical_transition_waypoint(
-            client=state.llm_client,
-            cache=state.cache,
-            instruction=goal_text,
-            selected_view=selected_view,
-            waypoint_target=str(step_decision.waypoint_target),
-            visual_action=visual_action,
-            geometry_warning=geometry_warning,
-            allow_revise_verdict=attempt_index + 1 < VERTICAL_WAYPOINT_VERIFICATION_MAX_ATTEMPTS,
-        )
-        attempt_payload["verification"] = verification.to_dict()
-        attempts.append(attempt_payload)
-        if verification.verdict == "execute":
-            waypoint = grounded_waypoint
-            if waypoint is None:
-                waypoint = ground_visual_waypoint(
-                    cache=state.cache,
-                    exploration=state.global_exploration_for_floor(str(state.system.current_floor_id)),
-                    obs_id=selected_view.obs_id,
-                    angle_deg=selected_view.angle_deg,
-                    point_2d=visual_action.point_2d,
-                    waypoint_target=str(step_decision.waypoint_target),
-                    target=str(visual_action.target),
-                    use_navigation_snap=False,
-                )
-            return VerticalTransitionWaypointPlan(
-                step_decision=step_decision,
-                visual_action=visual_action,
-                waypoint_verification=verification,
-                waypoint=waypoint,
-                selected_view=selected_view,
-                attempts=attempts,
-            )
-        if verification.verdict == "fallback_navigation":
-            raise VerticalTransitionStepReplan(
-                "waypoint_verifier_fallback_navigation",
-                feedback=_vertical_transition_step_replan_feedback(
-                    direction=direction,
-                    current_height_m=current_height_m,
-                    selected_view=selected_view,
-                    step_decision=step_decision,
-                    visual_action=visual_action,
-                    verification=verification,
-                    waypoint=grounded_waypoint,
-                    geometry_warning=geometry_warning,
-                ),
-            )
-        if verification.verdict != "revise_same_view":
-            raise ValueError(f"waypoint_verifier_{verification.verdict}:{verification.critique}")
-        revision_feedback = str(verification.critique)
-        rejected_point_2d = visual_action.point_2d
-    raise ValueError("vertical_waypoint_verification_exhausted")
+def _navprobe_vertical_task_context(step, action):
+    if str(action.args.get("task_context", "")).strip():
+        return str(action.args["task_context"])
+    retrieval = getattr(step, "episodic_retrieval", None) or {}
+    assessment = retrieval.get("final_progress_update", {}).get("task_state_assessment", "")
+    conclusions = [
+        {key: record.get(key) for key in ("query", "items", "conclusion")}
+        for record in retrieval.get("rounds", []) if record.get("conclusion")
+    ]
+    return (
+        f"Executive assessment: {assessment}\n"
+        f"Retrieval conclusions and references: {json.dumps(conclusions, ensure_ascii=False)}"
+    )
 
 
-def _vertical_waypoint_local_xy_distance_m(
-    *,
-    cache: "RuntimeCache",
-    waypoint: VisualWaypoint,
-) -> float:
-    observation = cache.get_observation(str(waypoint.obs_id)).observation
-    return float(
-        math.hypot(
-            float(waypoint.raw_world_xy[0]) - float(observation.pose.x),
-            float(waypoint.raw_world_xy[1]) - float(observation.pose.y),
-        )
+def _plan_navprobe_vertical_waypoint(
+    *, state, direction, visual_context, step_decision, current_height_m,
+    objective, task_context,
+):
+    del current_height_m
+    prepared = prepare_vertical_fss_candidates(
+        cache=state.cache, visual_context=visual_context,
+        exploration=state.global_exploration_for_floor(state.system.current_floor_id),
+        direction=direction, detector=state.detector,
+        map_floor_height=float(state.system.current_floor_height),
+        frontier_only=state.waypoint_policy_name == "frontier",
+    )
+    if not prepared.detected_stair_regions:
+        raise ValueError("no detected stair region in the current observation")
+    if not prepared.candidates:
+        raise ValueError("no visible height-connected stair FSS candidates")
+    memory = state.system.memory.task_progress
+    text = f"Original goal: {memory.original_goal}\n{memory.format_for_prompt()}\n{task_context}"
+    selected_label, reason = select_vertical_fss_waypoint(
+        client=state.llm_client, prepared=prepared, objective=objective,
+        local_target=step_decision.waypoint_target, task_context=text,
+    )
+    view, candidate, projection = prepared.selected(candidate_label=selected_label)
+    waypoint = vertical_fss_visual_waypoint(
+        selected_view=view, world_candidate=candidate, projected_candidate=projection,
+    )
+    return VerticalTransitionWaypointPlan(
+        step_decision=step_decision,
+        visual_action=VisualActionPointDecision(
+            point_2d=projection.point_2d, target=step_decision.waypoint_target,
+            reasoning=reason,
+        ),
+        waypoint_verification=VisualWaypointVerificationDecision(
+            verdict="execute", critique="Selected visible, height-connected FSS label: " + reason,
+        ),
+        waypoint=waypoint, selected_view=view,
+        attempts=[{"algorithm": "detected_stair_fss", "candidate_label": selected_label, "candidate_set": prepared.to_dict()}],
     )
 
 
@@ -822,7 +705,10 @@ def _vertical_transition_va_history_entry(
             "obs_id": str(waypoint_plan.selected_view.obs_id),
         },
         "step_decision": waypoint_plan.step_decision.to_dict(),
-        "va_attempts": _compact_va_attempts(waypoint_plan.attempts),
+        "waypoint_attempts": [
+            {"algorithm": item["algorithm"], "candidate_label": item["candidate_label"]}
+            for item in waypoint_plan.attempts
+        ],
         "final_visual_action": waypoint_plan.visual_action.to_dict(),
         "waypoint_verification": waypoint_plan.waypoint_verification.to_dict(),
         "grounded_waypoint": {
@@ -845,144 +731,6 @@ def _vertical_transition_va_history_entry(
     if str(failure_reason).strip() != "":
         entry["failure_reason"] = str(failure_reason)
     return entry
-
-
-def _vertical_transition_step_replan_feedback(
-    *,
-    direction: str,
-    current_height_m: float,
-    selected_view: VisualViewContext,
-    step_decision: VerticalTransitionStepDecision,
-    visual_action: VisualActionPointDecision,
-    verification: VisualWaypointVerificationDecision,
-    waypoint: VisualWaypoint | None,
-    geometry_warning: str,
-) -> dict[str, object]:
-    feedback: dict[str, object] = {
-        "type": "previous_waypoint_rejected",
-        "rejected_options": [
-            {
-                "angle_deg": int(selected_view.angle_deg),
-                "waypoint_target": str(step_decision.waypoint_target),
-            }
-        ],
-        "requested_direction": str(direction),
-        "previous_waypoint": {
-            "angle_deg": int(selected_view.angle_deg),
-            "obs_id": str(selected_view.obs_id),
-            "waypoint_target": str(step_decision.waypoint_target),
-            "selected_point_target": str(visual_action.target),
-            "point_2d": (
-                None
-                if visual_action.point_2d is None
-                else [float(visual_action.point_2d[0]), float(visual_action.point_2d[1])]
-            ),
-        },
-        "validation": {
-            "verdict": str(verification.verdict),
-            "critique": str(verification.critique),
-        },
-        "feedback": str(verification.critique),
-    }
-    if str(geometry_warning).strip() != "":
-        feedback["geometry_warning"] = str(geometry_warning)
-    if waypoint is not None:
-        waypoint_height = float(waypoint.raw_world_z)
-        height_delta = waypoint_height - float(current_height_m)
-        feedback["selected_waypoint_geometry"] = {
-            "raw_world_z": waypoint_height,
-            "current_height_m": float(current_height_m),
-            "height_delta_m": float(height_delta),
-        }
-    return feedback
-
-
-def _merge_vertical_transition_rejected_options(
-    previous_feedback: dict[str, object] | None,
-    current_feedback: dict[str, object],
-) -> list[dict[str, object]]:
-    options: list[dict[str, object]] = []
-    seen: set[tuple[int, str]] = set()
-    for feedback in (previous_feedback, current_feedback):
-        if not isinstance(feedback, dict):
-            continue
-        for raw_option in list(feedback.get("rejected_options", [])):
-            if not isinstance(raw_option, dict) or raw_option.get("angle_deg") is None:
-                continue
-            target = str(raw_option.get("waypoint_target", "")).strip()
-            if target == "":
-                continue
-            option = (int(raw_option["angle_deg"]), target)
-            if option in seen:
-                continue
-            seen.add(option)
-            options.append(
-                {
-                    "angle_deg": int(option[0]),
-                    "waypoint_target": str(option[1]),
-                }
-            )
-    return options
-
-
-def _compact_va_attempts(attempts: list[dict[str, object]]) -> list[dict[str, object]]:
-    compact: list[dict[str, object]] = []
-    for attempt in attempts:
-        item: dict[str, object] = {
-            "attempt_index": int(attempt.get("attempt_index", 0)),
-        }
-        visual_action = attempt.get("visual_action")
-        if isinstance(visual_action, dict):
-            item["visual_action"] = {
-                "point_2d": visual_action.get("point_2d"),
-                "target": str(visual_action.get("target", "")),
-                "failure_reason": str(visual_action.get("failure_reason", "")),
-            }
-        verification = attempt.get("verification")
-        if isinstance(verification, dict):
-            item["verification"] = {
-                "verdict": str(verification.get("verdict", "")),
-                "critique": str(verification.get("critique", "")),
-                "transition_complete_after_execution": bool(
-                    verification.get("transition_complete_after_execution", False)
-                ),
-            }
-        geometry_warning = str(attempt.get("geometry_warning", "")).strip()
-        if geometry_warning != "":
-            item["geometry_warning"] = geometry_warning
-        failure_reason = str(attempt.get("failure_reason", "")).strip()
-        if failure_reason != "":
-            item["failure_reason"] = failure_reason
-        compact.append(item)
-    return compact
-
-
-def _vertical_waypoint_geometry_warning(
-    *,
-    direction: str,
-    current_height_m: float,
-    waypoint: VisualWaypoint,
-) -> str:
-    waypoint_height = float(waypoint.raw_world_z)
-    height_delta = waypoint_height - float(current_height_m)
-    tolerance = float(VERTICAL_WAYPOINT_GEOMETRY_DIRECTION_TOLERANCE_M)
-    if direction == "down" and height_delta > tolerance:
-        return (
-            "Geometry estimates the selected waypoint is higher than the current position "
-            f"(waypoint_z={waypoint_height:.3f}m, current_z={float(current_height_m):.3f}m, "
-            f"delta={height_delta:+.3f}m). The requested vertical transition is Go down stairs, "
-            "so the waypoint may be on an upward or opposite-direction path. "
-            "Reconsider the selected direction or local waypoint region for the requested downward transition."
-        )
-    if direction == "up" and height_delta < -tolerance:
-        return (
-            "Geometry estimates the selected waypoint is lower than the current position "
-            f"(waypoint_z={waypoint_height:.3f}m, current_z={float(current_height_m):.3f}m, "
-            f"delta={height_delta:+.3f}m). The requested vertical transition is Go upstairs, "
-            "so the waypoint may be on a downward or opposite-direction path. "
-            "Reconsider the selected direction or local waypoint region for the requested upward transition."
-        )
-    return ""
 
 
 def _vertical_transition_directional_height_progress(
@@ -1161,6 +909,8 @@ def _record_vertical_transition_node_move(
     rgb_history_obs_ids: list[str],
     planning_node_id: str,
     backtrack_contexts: list[dict[str, object]],
+    subgoal_id: str | None = None,
+    subgoal_attempt: int | None = None,
 ) -> None:
     if str(before_node_id).strip() == "" or str(after_node_id).strip() == "":
         return
@@ -1174,6 +924,8 @@ def _record_vertical_transition_node_move(
         "reason": f"vertical_transition_{direction}",
         "rgb_history_obs_ids": [str(obs_id) for obs_id in rgb_history_obs_ids],
     }
+    if subgoal_id is not None:
+        record.update(subgoal_id=subgoal_id, subgoal_attempt=subgoal_attempt)
     if backtrack_contexts != []:
         record["backtrack_reference_node_id"] = str(planning_node_id)
         record["backtrack_contexts"] = [
@@ -1196,16 +948,20 @@ def _complete_vertical_transition(
     final_panorama: PanoramaCaptureResult,
     rgb_history_obs_ids: list[str],
     path_xy: list[tuple[float, float]],
+    destination_floor_reached: bool,
 ) -> dict[str, object]:
     anchor_obs_id = str(final_panorama.anchor_obs_id)
     anchor_observation = cache.get_observation(anchor_obs_id).observation
     after_height = float(anchor_observation.pose.z)
-    after_floor, created_floor = _resolve_vertical_transition_floor(
-        graph=graph,
-        before_floor_id=before_floor_id,
-        after_height=after_height,
-        floor_match_threshold_m=float(floor_match_threshold_m),
-    )
+    if destination_floor_reached:
+        after_floor, created_floor = _resolve_vertical_transition_floor(
+            graph=graph,
+            before_floor_id=before_floor_id,
+            after_height=after_height,
+            floor_match_threshold_m=float(floor_match_threshold_m),
+        )
+    else:
+        after_floor, created_floor = graph.floors[before_floor_id], False
     after_node_id = _create_place_node(
         graph=graph,
         cache=cache,
@@ -1229,6 +985,7 @@ def _complete_vertical_transition(
         "after_floor_id": str(after_floor.id),
         "after_floor_height": float(after_floor.height),
         "created_floor": bool(created_floor),
+        "destination_floor_reached": bool(destination_floor_reached),
         "edge_id": str(edge.id),
         "edge_relation": str(edge.relation),
         "current_obs_id_after": anchor_obs_id,
@@ -1261,16 +1018,6 @@ def _resolve_vertical_transition_floor(
         matched_floor.height = float(after_height)
         return matched_floor, False
     return graph.add_floor(height=float(after_height)), True
-
-
-def _vertical_transition_goal_text(direction: str) -> str:
-    return _vertical_transition_instruction(direction)
-
-
-def _vertical_transition_instruction(direction: str) -> str:
-    if direction == "up":
-        return "Go upstairs."
-    return "Go downstairs."
 
 
 def _current_episode_step(context: "NavClawAgentContext") -> int:

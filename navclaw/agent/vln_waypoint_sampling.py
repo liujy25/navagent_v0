@@ -964,6 +964,7 @@ def generate_vln_unified_sampled_waypoint_candidates(
     avoid_node_xys: list[tuple[float, float]] | None = None,
     node_dedup_radius_m: float = VLN_WAYPOINT_NODE_DEDUP_RADIUS_M,
     node_dedup_map: "GlobalBEVMap | None" = None,
+    frontier_only: bool = False,
 ) -> list[VlnProjectedSampledWaypointCandidate]:
     if views == []:
         raise ValueError("unified sampled waypoint generation requires at least one view")
@@ -981,20 +982,19 @@ def generate_vln_unified_sampled_waypoint_candidates(
         VLN_WAYPOINT_FINAL_MERGE_DISTANCE_M,
         sample_spacing_m,
     )
-    anchors = [
-        *_registered_frontier_anchors_unified(
-            frontier_records=frontier_records,
-            robot_xy=robot_xy,
-            min_distance_m=min_distance_m,
-            anchor_spacing_m=anchor_spacing_m,
-        ),
-        *_skeleton_anchors_unified(
+    anchors = _registered_frontier_anchors_unified(
+        frontier_records=frontier_records,
+        robot_xy=robot_xy,
+        min_distance_m=min_distance_m,
+        anchor_spacing_m=anchor_spacing_m,
+    )
+    if not frontier_only:
+        anchors.extend(_skeleton_anchors_unified(
             map_obj=map_obj,
             robot_xy=robot_xy,
             min_distance_m=min_distance_m,
             anchor_spacing_m=anchor_spacing_m,
-        ),
-    ]
+        ))
     anchors = _nms_anchors(
         anchors,
         min_distance_m=combined_anchor_spacing_m,

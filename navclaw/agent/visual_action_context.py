@@ -9,6 +9,7 @@ from navclaw.llm.image_preprocessing import LLM_CAMERA_IMAGE_MAX_SIZE
 
 if TYPE_CHECKING:
     from navclaw.agent.state import NavClawAgentState, NavClawStepState
+    from navclaw.graph.edge import Edge
 
 
 PANORAMA_DIRECTION_ORDER = ("front", "back", "left", "right")
@@ -76,6 +77,8 @@ def allowed_directions_text(angles: list[int]) -> str:
     return "[" + ", ".join(allowed_directions(angles)) + "]"
 
 
+
+
 @dataclass(frozen=True)
 class VisualViewContext:
     angle_deg: int
@@ -85,6 +88,7 @@ class VisualViewContext:
     pose: dict[str, object] = field(default_factory=dict)
     node_overlay_image_id: str = ""
     visible_visited_nodes: list[str] = field(default_factory=list)
+    visible_arrival_edge_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -95,6 +99,7 @@ class VisualViewContext:
             "pose": deepcopy(self.pose),
             "node_overlay_image_id": str(self.node_overlay_image_id),
             "visible_visited_nodes": [str(node_id) for node_id in self.visible_visited_nodes],
+            "visible_arrival_edge_ids": list(self.visible_arrival_edge_ids),
         }
 
 
@@ -124,6 +129,8 @@ class VisualActionContext:
     previous_arrival_node_id: str = ""
     previous_arrival_angle_deg: int | None = None
     graph_context_visible: bool = True
+    arrival_edge_id: str = ""
+    arrival_src_node_id: str = ""
 
     @property
     def available_angles(self) -> list[int]:
@@ -151,6 +158,8 @@ class VisualActionContext:
             if self.previous_arrival_angle_deg is None
             else int(self.previous_arrival_angle_deg),
             "graph_context_visible": bool(self.graph_context_visible),
+            "arrival_edge_id": str(self.arrival_edge_id),
+            "arrival_src_node_id": str(self.arrival_src_node_id),
         }
 
 
@@ -159,14 +168,18 @@ def build_visual_action_context(
     state: "NavClawAgentState",
     step: "NavClawStepState",
     context_evidence_text: str,
+    include_arrival_edge: bool = False,
 ) -> VisualActionContext:
-    include_graph_context = True
     current_node_id = str(step.current_place_node_id or state.current_place_node_id or "")
     if current_node_id == "":
         raise ValueError("visual action context requires current_place_node_id")
     views = _views_from_step(step)
-    if include_graph_context:
-        views = _attach_place_node_overlays(state=state, views=views)
+    arrival_edge = (
+        _latest_arrival_edge(state=state, current_node_id=current_node_id)
+        if include_arrival_edge
+        else None
+    )
+    views = _attach_place_node_overlays(state=state, views=views, arrival_edge=arrival_edge)
     return VisualActionContext(
         current_node_id=current_node_id,
         views=views,
@@ -176,13 +189,11 @@ def build_visual_action_context(
         ),
         edge_rgb_history_blocks=_edge_rgb_history_blocks(
             state=state,
-            include_node_ids=include_graph_context,
+            include_node_ids=True,
         ),
-        context_evidence_text=(str(context_evidence_text) if include_graph_context else ""),
+        context_evidence_text=str(context_evidence_text),
         previous_arrival_node_id=(
             _previous_arrival_node_id(state=state, current_node_id=current_node_id)
-            if include_graph_context
-            else ""
         ),
         previous_arrival_angle_deg=(
             _previous_arrival_angle_deg(
@@ -190,10 +201,10 @@ def build_visual_action_context(
                 current_node_id=current_node_id,
                 available_angles=visual_action_angles(views),
             )
-            if include_graph_context
-            else None
         ),
-        graph_context_visible=include_graph_context,
+        graph_context_visible=True,
+        arrival_edge_id="" if arrival_edge is None else str(arrival_edge.id),
+        arrival_src_node_id="" if arrival_edge is None else str(arrival_edge.src_id),
     )
 
 
@@ -203,7 +214,6 @@ def build_visual_action_context_for_node(
     node_id: str,
     context_evidence_text: str,
 ) -> VisualActionContext:
-    include_graph_context = True
     node_id_text = str(node_id).strip()
     if node_id_text == "":
         raise ValueError("visual action context requires node_id")
@@ -213,8 +223,7 @@ def build_visual_action_context_for_node(
         raise ValueError(f"node {node_id_text!r} has no stored panorama obs_ids")
     angle_to_obs_id = _angle_to_obs_id_from_ordered_obs_ids(obs_ids)
     views = _views_from_angle_to_obs_id(state=state, angle_to_obs_id=angle_to_obs_id)
-    if include_graph_context:
-        views = _attach_place_node_overlays(state=state, views=views)
+    views = _attach_place_node_overlays(state=state, views=views)
     return VisualActionContext(
         current_node_id=node_id_text,
         views=views,
@@ -224,13 +233,11 @@ def build_visual_action_context_for_node(
         ),
         edge_rgb_history_blocks=_edge_rgb_history_blocks(
             state=state,
-            include_node_ids=include_graph_context,
+            include_node_ids=True,
         ),
-        context_evidence_text=(str(context_evidence_text) if include_graph_context else ""),
+        context_evidence_text=str(context_evidence_text),
         previous_arrival_node_id=(
             _previous_arrival_node_id(state=state, current_node_id=node_id_text)
-            if include_graph_context
-            else ""
         ),
         previous_arrival_angle_deg=(
             _previous_arrival_angle_deg(
@@ -238,10 +245,8 @@ def build_visual_action_context_for_node(
                 current_node_id=node_id_text,
                 available_angles=visual_action_angles(views),
             )
-            if include_graph_context
-            else None
         ),
-        graph_context_visible=include_graph_context,
+        graph_context_visible=True,
     )
 
 
@@ -319,6 +324,7 @@ def _attach_place_node_overlays(
     *,
     state: "NavClawAgentState",
     views: list[VisualViewContext],
+    arrival_edge: Edge | None = None,
 ) -> list[VisualViewContext]:
     floor_id = str(state.system.current_floor_id)
     exploration = state.global_exploration_for_floor(floor_id)
@@ -328,6 +334,7 @@ def _attach_place_node_overlays(
         obs_ids=[str(view.obs_id) for view in views],
         floor_id=floor_id,
         image_max_size=LLM_CAMERA_IMAGE_MAX_SIZE,
+        **({"arrival_edge": arrival_edge} if arrival_edge is not None else {}),
     )
     overlays_by_obs_id = {
         str(overlay.obs_id): overlay
@@ -344,9 +351,31 @@ def _attach_place_node_overlays(
                 view,
                 node_overlay_image_id=str(overlay.overlay_id),
                 visible_visited_nodes=[str(node_id) for node_id in overlay.node_ids],
+                visible_arrival_edge_ids=list(overlay.edge_ids),
             )
         )
     return annotated_views
+
+
+def _latest_arrival_edge(*, state: "NavClawAgentState", current_node_id: str) -> Edge | None:
+    history = list(getattr(state, "node_move_history", []))
+    if not history or str(state.current_place_node_id) != str(current_node_id):
+        return None
+    latest = history[-1]
+    if str(latest.get("to_node", "")) != str(current_node_id):
+        return None
+    for edge in state.graph.iter_edges(include_vertical=True):
+        if (
+            str(edge.src_id) != str(latest.get("from_node", ""))
+            or str(edge.dst_id) != str(current_node_id)
+            or edge.relation not in {"move", "stairs_up", "stairs_down"}
+        ):
+            continue
+        # Graph edges retain their first traversal; the arrival uses this move's path.
+        path = latest.get("path_xy", edge.path_xy if edge.traversal_count == 1 else [])
+        if len(path) >= 2:
+            return replace(edge, path_xy=[tuple(point) for point in path])
+    return None
 
 
 def _recent_edge_rgb_history_obs_ids(

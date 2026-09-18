@@ -8,10 +8,9 @@ class VlnRuntimeConfig:
     """Fixed mainline settings plus robot-specific safety bounds."""
 
     max_place_steps: int = 40
-    max_retrieve_rounds: int = 8
+    max_retrieve_rounds: int = 6
     candidate_prune_radius: float = 1.0
     candidate_dedup_radius: float = 0.8
-    max_vertical_transition_steps: int = 8
     vertical_floor_match_threshold_m: float = 0.8
     bev_min_height_m: float = 0.3
     bev_max_height_m: float = 1.4
@@ -22,8 +21,6 @@ class VlnRuntimeConfig:
             raise ValueError("max_place_steps must be positive")
         if self.max_retrieve_rounds <= 0:
             raise ValueError("max_retrieve_rounds must be positive")
-        if self.max_vertical_transition_steps <= 0:
-            raise ValueError("max_vertical_transition_steps must be positive")
         if self.robot_radius_m <= 0.0:
             raise ValueError("robot_radius_m must be positive")
 

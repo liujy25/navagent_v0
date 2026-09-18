@@ -47,7 +47,10 @@ class NavClawAgentState:
     llm_client: LLMClient
     detector: DetectorInterface
     action_executor: LocalmapActionExecutor
-    max_retrieve_rounds: int = 8
+    waypoint_policy_name: str = "frontier_skeleton_sample"
+    episodic_retrieval_enabled: bool = True
+    show_cardinal_bev: bool = False
+    max_retrieve_rounds: int = 6
     global_explorations_by_floor: dict[str, ExplorationManager] = field(default_factory=dict)
     frontier_filter_explorations_by_floor: dict[str, ExplorationManager] = field(default_factory=dict)
     frontier_records_by_floor: dict[str, dict[str, LocalmapFrontierRecord]] = field(default_factory=dict)
@@ -72,6 +75,10 @@ class NavClawAgentState:
     pending_stop_confirmation: dict[str, object] | None = None
     stop_confirmation_history: list[dict[str, object]] = field(default_factory=list)
     consecutive_need_more_evidence_count: int = 0
+
+    @property
+    def completed_stair_items(self):
+        return self.system.memory.task_progress.completed_stair_items
 
     def __post_init__(self) -> None:
         if int(self.max_retrieve_rounds) <= 0:

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "navagent-v0"
-version = "0.1.0"
-description = "Robot-facing canonical NavClaw visual language navigation agent"
+version = "0.2.0"
+description = "Standalone robot-facing NavProbe visual language navigation agent"
 requires-python = ">=3.9"
 dependencies = [
   "flask>=3.0",

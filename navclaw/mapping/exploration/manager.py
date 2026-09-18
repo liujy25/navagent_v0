@@ -8,9 +8,12 @@ from PIL import ImageDraw
 
 from navclaw.env.interface import RawObservation
 from navclaw.graph.graph import Graph
+from navclaw.graph.edge import Edge
 from navclaw.llm.image_preprocessing import resize_rgb_to_fit
 from navclaw.llm.image_preprocessing import scale_xy
 from navclaw.runtime.cache import RuntimeCache
+from navclaw.visualization.trajectory import draw_rgb_trajectory
+from navclaw.visualization.trajectory import edge_display_path_xyz
 
 from navclaw.mapping.exploration.bev_map import FrontierCandidate, GlobalBEVMap
 from navclaw.mapping.exploration.bev_visuals import (
@@ -19,6 +22,7 @@ from navclaw.mapping.exploration.bev_visuals import (
     BEV_OBSTACLE_COLOR,
     BEV_UNKNOWN_BACKGROUND_COLOR,
     draw_numbered_circle_marker,
+    numbered_circle_marker_draw_center,
     place_node_marker_style,
 )
 from navclaw.mapping.exploration.frontier_buffer import FrontierBuffer
@@ -263,6 +267,36 @@ class ExploreView:
         }
 
 
+def project_visible_trajectory(
+    *, observation, path_xyz: np.ndarray, image_size: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Use the same camera and resize coordinates as the place-node overlay."""
+    height, width = np.asarray(observation.rgb).shape[:2]
+    projected, depths, valid = _project_points(
+        path_xyz,
+        np.asarray(observation.T_cam_odom, dtype=np.float32),
+        np.asarray(observation.intrinsics, dtype=np.float32),
+        width, height,
+    )
+    visible = _compute_unoccluded_mask(
+        projected, depths, valid, np.asarray(observation.depth),
+        depth_tolerance_m=0.15,
+    )
+    scaled = np.asarray([
+        scale_xy(tuple(point), scale_x=image_size[0] / width, scale_y=image_size[1] / height)
+        for point in projected
+    ])
+    node_style = place_node_marker_style(
+        image_width=image_size[0], image_height=image_size[1], mode="rgb",
+    )
+    for index in (0, len(scaled) - 1):
+        if len(scaled) and visible[index]:
+            scaled[index] = numbered_circle_marker_draw_center(
+                tuple(scaled[index]), style=node_style, image_size=image_size,
+            )
+    return scaled, visible
+
+
 @dataclass
 class PlaceNodeOverlayView:
     obs_id: str
@@ -494,6 +528,7 @@ class ExplorationManager:
         obs_ids: list[str],
         floor_id: str | None = None,
         image_max_size: tuple[int, int] | None = None,
+        arrival_edge: Edge | None = None,
     ) -> list[PlaceNodeOverlayView]:
         floor_id_str = None if floor_id is None else str(floor_id)
         with graph.lock:
@@ -507,6 +542,13 @@ class ExplorationManager:
             ]
         if place_nodes == []:
             return []
+        arrival_path = None
+        if arrival_edge is not None and len(arrival_edge.path_xy) >= 2:
+            arrival_path = edge_display_path_xyz(
+                edge=arrival_edge,
+                src_node=graph.get_node(arrival_edge.src_id),
+                dst_node=graph.get_node(arrival_edge.dst_id),
+            )
 
         views: list[PlaceNodeOverlayView] = []
         for obs_id in obs_ids:
@@ -534,6 +576,14 @@ class ExplorationManager:
             scale_y = float(resized.metadata["scale_y"])
             image = Image.fromarray(render_rgb.copy()).convert("RGBA")
             draw = ImageDraw.Draw(image, "RGBA")
+
+            edge_ids: list[str] = []
+            if arrival_path is not None:
+                projected_path, path_visible = project_visible_trajectory(
+                    observation=observation, path_xyz=arrival_path, image_size=image.size,
+                )
+                if draw_rgb_trajectory(draw=draw, projected=projected_path, valid=path_visible):
+                    edge_ids.append(str(arrival_edge.id))
 
             projected_nodes: list[_ProjectedPlaceNodeOverlay] = []
             for node in place_nodes:
@@ -586,7 +636,7 @@ class ExplorationManager:
                         distance_m=float(np.linalg.norm(np.asarray(node_xy, dtype=np.float64) - robot_xy)),
                     )
                 )
-            if projected_nodes == []:
+            if projected_nodes == [] and edge_ids == []:
                 continue
 
             node_font = _frontier_badge_font(RGB_FRONTIER_BADGE_FONT_SIZE_MAX_PX)
@@ -614,7 +664,7 @@ class ExplorationManager:
                     "obs_id": str(obs_id),
                     "floor_id": floor_id_str,
                     "node_ids": list(node_ids),
-                    "edge_ids": [],
+                    "edge_ids": list(edge_ids),
                 },
             )
             views.append(
@@ -622,7 +672,7 @@ class ExplorationManager:
                     obs_id=str(obs_id),
                     overlay_id=str(overlay_record.id),
                     node_ids=list(node_ids),
-                    edge_ids=[],
+                    edge_ids=list(edge_ids),
                 )
             )
         return views

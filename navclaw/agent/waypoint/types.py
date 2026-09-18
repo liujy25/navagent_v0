@@ -16,6 +16,19 @@ if TYPE_CHECKING:
 
 
 FRONTIER_SKELETON_SAMPLE_WAYPOINT_POLICY = "frontier_skeleton_sample"
+SAMPLED_WAYPOINT_POLICY_NAMES = (
+    FRONTIER_SKELETON_SAMPLE_WAYPOINT_POLICY,
+)
+WAYPOINT_POLICY_NAMES = SAMPLED_WAYPOINT_POLICY_NAMES
+
+
+def validate_waypoint_policy(
+    *, waypoint_policy_name: str,
+) -> None:
+    if waypoint_policy_name not in WAYPOINT_POLICY_NAMES:
+        raise ValueError(f"unsupported waypoint policy: {waypoint_policy_name!r}")
+
+
 @dataclass(frozen=True)
 class GroundedWaypointTarget:
     goal_xy: tuple[float, float]
@@ -28,7 +41,6 @@ class GroundedWaypointTarget:
     angle_deg: int | None = None
     point_2d: tuple[float, float] | None = None
     raw_world_xy: tuple[float, float] | None = None
-    consume_frontier_id: str = ""
 
     def to_action_call(self) -> ActionCall:
         args: dict[str, object] = {
@@ -60,7 +72,6 @@ class GroundedWaypointTarget:
                 if self.raw_world_xy is None
                 else [float(self.raw_world_xy[0]), float(self.raw_world_xy[1])]
             ),
-            "consume_frontier_id": str(self.consume_frontier_id),
         }
 
 
@@ -98,6 +109,7 @@ class WaypointPlanningContext:
     task_progress_initialization: dict[str, object]
     navigation_mode: NavigationModeDecision
     task_progress_update_result: TaskProgressUpdateResult
+    verify_memory_update_result: dict[str, object]
     context_evidence_text: str
     execution_visual_context: VisualActionContext | None = None
     inherited_agent_context_content: list[dict[str, object]] = field(default_factory=list)

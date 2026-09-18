@@ -54,9 +54,9 @@ def manage_retrieved_knowledge(
         for round_record in workspace.rounds
     ]
     system_prompt = """
-You are the Entity Knowledge Manager (EKM) in NavClaw.
+You are the Entity Knowledge Manager (EKM) in NavProbe.
 Convert evidence-grounded retrieval conclusions into compact reusable knowledge for the entities retrieved in the current decision step.
-Do not change task progress, reinterpret raw visual evidence, or alter the selected high-level action.
+Maintain entity-local facts about visited places, executed transitions, and observed landmarks, using the supplied conclusions and existing knowledge.
 Return only valid JSON matching the provided output contract.
 """.strip()
     user_prompt = f"""
@@ -66,7 +66,7 @@ Retrieved entity refs:
 Retrieval trace:
 {json.dumps(retrieval_rounds, ensure_ascii=False, indent=2)}
 
-Committed task-progress updates:
+Committed task-state updates:
 {json.dumps(progress_updates, ensure_ascii=False, indent=2)}
 
 Existing entity knowledge:
@@ -76,13 +76,13 @@ Decision objective:
 Update only the retrieved entities with compact facts that remain useful beyond the current decision step.
 
 Retrieval-trace semantics:
-- Each round contains its verification query, the entity-field request that was materialized, and TPU's conclusion from that evidence.
+- Each round contains its verification query, the entity-field request that was materialized, and the task executive's conclusion from that evidence.
 - A fact written to an entity must be supported by a conclusion derived from evidence requested from that entity.
 - Use only details stated in the supplied conclusions; raw retrieved images are not provided to this module.
 
 Entity-knowledge semantics:
 - Entity knowledge is a concise retrieval-derived fact associated with one node, edge, or landmark.
-- It is not raw observation data, a task-progress condition, a temporary query, or a navigation command.
+- Keep entity facts distinct from task-state predicates, temporary queries, and navigation commands.
 
 Update rules:
 - Use only refs listed in `Retrieved entity refs`.
@@ -91,7 +91,7 @@ Update rules:
 - Remove an existing fact only when the retrieval trace establishes that it is invalid; absence of new support is insufficient.
 - Do not create duplicates or paraphrased copies of existing knowledge.
 - Do not store the current action choice, waypoint candidate, temporary uncertainty, retrieval query wording, or policy advice.
-- Task-progress updates may establish why a fact matters but are not independent evidence about an entity.
+- Task-state updates may establish why a fact matters; the retrieval conclusions supply the evidence about the entity.
 - Return an empty list when no reusable entity knowledge changes.
 
 Output contract:

@@ -38,7 +38,7 @@ def test_cli_exposes_only_robot_vln_controls() -> None:
 
 def test_runtime_and_goal_are_fixed_to_canonical_vln() -> None:
     config = VlnRuntimeConfig()
-    assert config.max_retrieve_rounds == 8
+    assert config.max_retrieve_rounds == 6
     goal = vln_instruction_goal_spec("Walk past the table and stop by the door.")
     assert goal.goal_kind == "vln_instruction"
     assert goal.navigation_goal_text().startswith("Walk past")

@@ -260,6 +260,19 @@ def _numbered_circle_text_y_offset(font: ImageFont.ImageFont) -> float:
     return -((float(bbox[1]) + float(bbox[3])) / 2.0)
 
 
+def numbered_circle_marker_draw_center(
+    center_xy: tuple[float, float],
+    *,
+    style: NumberedCircleMarkerStyle,
+    image_size: tuple[int, int],
+) -> tuple[float, float]:
+    patch_radius = math.ceil(style.radius_px + math.ceil(style.outline_width_px + 3.0))
+    return tuple(
+        float(min(max(value, patch_radius), max(patch_radius, size - patch_radius - 1)))
+        for value, size in zip(center_xy, image_size)
+    )
+
+
 def draw_numbered_circle_marker(
     image: Image.Image,
     center_xy: tuple[float, float],
@@ -274,15 +287,7 @@ def draw_numbered_circle_marker(
     patch_margin = int(math.ceil(float(style.outline_width_px) + 3.0))
     patch_radius = int(math.ceil(radius + float(patch_margin)))
     patch_size = max(1, patch_radius * 2 + 1)
-    width, height = int(image.size[0]), int(image.size[1])
-    cx = min(
-        max(float(center_xy[0]), float(patch_radius)),
-        max(float(patch_radius), float(width) - float(patch_radius) - 1.0),
-    )
-    cy = min(
-        max(float(center_xy[1]), float(patch_radius)),
-        max(float(patch_radius), float(height) - float(patch_radius) - 1.0),
-    )
+    cx, cy = numbered_circle_marker_draw_center(center_xy, style=style, image_size=image.size)
     high_size = int(patch_size * scale)
     high_radius = float(radius) * float(scale)
     high_center = float(high_size) / 2.0

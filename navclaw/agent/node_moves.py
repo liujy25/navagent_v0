@@ -19,6 +19,8 @@ def set_pending_node_move(
     reason: str,
     move_mode: str = "move",
     backtrack_reference_node_id: str | None = None,
+    subgoal_id: str | None = None,
+    subgoal_attempt: int | None = None,
     backtrack_contexts: list[dict[str, object]] | None = None,
     rgb_history_obs_ids: list[str] | None = None,
     path_xy: list[list[float]] | list[tuple[float, float]] | None = None,
@@ -38,6 +40,8 @@ def set_pending_node_move(
         if backtrack_reference_node_id is None
         else str(backtrack_reference_node_id).strip()
     )
+    if subgoal_id is not None:
+        pending.update(subgoal_id=subgoal_id, subgoal_attempt=subgoal_attempt)
     if backtrack_reference_node_text != "":
         pending["backtrack_reference_node_id"] = backtrack_reference_node_text
     normalized_backtrack_contexts = [
@@ -72,6 +76,8 @@ def complete_pending_node_move(
         from_node_id=from_node_id,
         to_node_id=to_node_id,
         reason=str(pending.get("reason", "")),
+        subgoal_id=pending.get("subgoal_id"),
+        subgoal_attempt=pending.get("subgoal_attempt"),
         move_mode=str(pending.get("move_mode", "move")),
         backtrack_reference_node_id=str(
             pending.get("backtrack_reference_node_id", "")
@@ -98,6 +104,8 @@ def record_node_move(
     reason: str,
     move_mode: str = "move",
     backtrack_reference_node_id: str | None = None,
+    subgoal_id: str | None = None,
+    subgoal_attempt: int | None = None,
     backtrack_contexts: list[dict[str, object]] | None = None,
     rgb_history_obs_ids: list[str] | None = None,
     path_xy: list[list[float]] | list[tuple[float, float]] | None = None,
@@ -154,7 +162,10 @@ def record_node_move(
         "move_mode": str(move_mode),
         "reason": str(reason),
         "rgb_history_obs_ids": [str(obs_id) for obs_id in rgb_history],
+        "path_xy": list(normalized_path_xy),
     }
+    if subgoal_id is not None:
+        record.update(subgoal_id=subgoal_id, subgoal_attempt=subgoal_attempt)
     if backtrack_reference_node_text != "":
         record["backtrack_reference_node_id"] = backtrack_reference_node_text
     if normalized_backtrack_contexts != []:

@@ -14,7 +14,7 @@ from navclaw.perception.detectors.yoloworld_local import DEFAULT_YOLOWORLD_MODEL
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the canonical NavClaw VLN agent on a robot RPC service."
+        description="Run the NavProbe VLN agent on a robot RPC service."
     )
     parser.add_argument("--robot-url", required=True)
     parser.add_argument("--instruction", required=True)
